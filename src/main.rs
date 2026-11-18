@@ -86,8 +86,11 @@ async fn dispatch(args: Vec<String>) -> Result<(), String> {
         index += 1;
     }
 
-    let cfg =
-        Arc::new(Config::from_env().map_err(|error| format!("configuration error: {error}"))?);
+    let mut cfg = Config::from_env().map_err(|error| format!("configuration error: {error}"))?;
+    if let Some(limit) = max_subjects {
+        cfg.max_subjects_per_run = limit.clamp(1, 200);
+    }
+    let cfg = Arc::new(cfg);
     log::init(&cfg.log_level);
     log::info(format!("AirRadar {VERSION} starting"));
     if let Some(url) = probe_url {
@@ -120,17 +123,6 @@ async fn dispatch(args: Vec<String>) -> Result<(), String> {
             .run_blocking(request)
             .await
             .ok_or("another refresh is already running")?;
-        if let Some(limit) = max_subjects {
-            if limit != summary.subjects_processed {
-                // max_subjects is only used to size the run before it starts; a
-                // mismatch means the CLI value was smaller than the configured
-                // window, which cannot happen because RunOptions is fixed.
-                log::warn(format!(
-                    "--max-subjects {limit} note: configured MAX_SUBJECTS_PER_RUN={}",
-                    cfg.max_subjects_per_run
-                ));
-            }
-        }
         let json = serde_json::to_string_pretty(&summary)
             .map_err(|error| format!("serialize summary: {error}"))?;
         println!("{json}");
