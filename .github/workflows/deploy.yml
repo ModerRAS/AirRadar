@@ -1,0 +1,174 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to deploy (rollback), e.g. sha-1a2b3c4. Empty = build and deploy this commit."
+        required: false
+        default: ""
+      update_secrets:
+        description: "Rotate docker secrets (removes and redeploys the stack, brief downtime)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      STACK_NAME: ${{ vars.STACK_NAME || 'airradar' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/airradar' }}
+      TRAEFIK_HOST: ${{ secrets.TRAEFIK_HOST || vars.TRAEFIK_HOST }}
+      TRAEFIK_ENTRYPOINTS: ${{ secrets.TRAEFIK_ENTRYPOINTS || vars.TRAEFIK_ENTRYPOINTS || 'websecure' }}
+      TRAEFIK_CERTRESOLVER: ${{ secrets.TRAEFIK_CERTRESOLVER || vars.TRAEFIK_CERTRESOLVER || 'letsencrypt' }}
+      TRAEFIK_NETWORK: ${{ secrets.TRAEFIK_NETWORK || vars.TRAEFIK_NETWORK || 'traefik-public' }}
+      BANGUMI_UA: ${{ vars.BANGUMI_UA || 'AirRadar/0.1.0 (+https://github.com/ModerRAS/AirRadar)' }}
+      REFRESH_HOURS: ${{ vars.REFRESH_HOURS || '6' }}
+      MAX_SUBJECTS_PER_RUN: ${{ vars.MAX_SUBJECTS_PER_RUN || '30' }}
+      MAX_SEARCH_CALLS: ${{ vars.MAX_SEARCH_CALLS || '60' }}
+      MAX_LLM_CALLS: ${{ vars.MAX_LLM_CALLS || '10' }}
+      SEARCH_PROVIDER_ORDER: ${{ vars.SEARCH_PROVIDER_ORDER || 'brave,tavily,deepseek' }}
+      INCLUDE_PLATFORMS: ${{ vars.INCLUDE_PLATFORMS || 'TV,WEB' }}
+      SEASON_OVERRIDE: ${{ vars.SEASON_OVERRIDE || '' }}
+      LOG_LEVEL: ${{ vars.LOG_LEVEL || 'info' }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || '' }}
+      LLM_MODEL: ${{ vars.LLM_MODEL || '' }}
+      CACHE_MAX_BYTES: ${{ vars.CACHE_MAX_BYTES || '268435456' }}
+      HISTORY_KEEP: ${{ vars.HISTORY_KEEP || '10' }}
+      UPDATE_SECRETS: ${{ github.event.inputs.update_secrets || 'false' }}
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+      BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      GHCR_USER: ${{ secrets.GHCR_USER || github.repository_owner }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve deployment image
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            ref="${{ github.event.inputs.image_tag }}"
+          else
+            ref="sha-${GITHUB_SHA::7}"
+          fi
+          echo "SCHEDULE_IMAGE=$repo:$ref" >> "$GITHUB_ENV"
+          echo "Deploying $repo:$ref"
+      - name: Ensure remote deploy directory
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          envs: DEPLOY_PATH
+          script: |
+            set -euo pipefail
+            mkdir -p "$DEPLOY_PATH"
+            echo "deploy directory ready: $DEPLOY_PATH"
+      - name: Upload stack and deploy script
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "docker-stack.yml,scripts/deploy-vps.sh"
+          target: ${{ env.DEPLOY_PATH }}
+          overwrite: true
+      - name: Deploy stack over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          SCHEDULE_IMAGE: ${{ env.SCHEDULE_IMAGE }}
+          STACK_NAME: ${{ env.STACK_NAME }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+          TRAEFIK_HOST: ${{ env.TRAEFIK_HOST }}
+          TRAEFIK_ENTRYPOINTS: ${{ env.TRAEFIK_ENTRYPOINTS }}
+          TRAEFIK_CERTRESOLVER: ${{ env.TRAEFIK_CERTRESOLVER }}
+          TRAEFIK_NETWORK: ${{ env.TRAEFIK_NETWORK }}
+          BANGUMI_UA: ${{ env.BANGUMI_UA }}
+          REFRESH_HOURS: ${{ env.REFRESH_HOURS }}
+          MAX_SUBJECTS_PER_RUN: ${{ env.MAX_SUBJECTS_PER_RUN }}
+          MAX_SEARCH_CALLS: ${{ env.MAX_SEARCH_CALLS }}
+          MAX_LLM_CALLS: ${{ env.MAX_LLM_CALLS }}
+          SEARCH_PROVIDER_ORDER: ${{ env.SEARCH_PROVIDER_ORDER }}
+          INCLUDE_PLATFORMS: ${{ env.INCLUDE_PLATFORMS }}
+          SEASON_OVERRIDE: ${{ env.SEASON_OVERRIDE }}
+          LOG_LEVEL: ${{ env.LOG_LEVEL }}
+          LLM_BASE_URL: ${{ env.LLM_BASE_URL }}
+          LLM_MODEL: ${{ env.LLM_MODEL }}
+          CACHE_MAX_BYTES: ${{ env.CACHE_MAX_BYTES }}
+          HISTORY_KEEP: ${{ env.HISTORY_KEEP }}
+          UPDATE_SECRETS: ${{ env.UPDATE_SECRETS }}
+          ADMIN_TOKEN: ${{ env.ADMIN_TOKEN }}
+          BRAVE_API_KEY: ${{ env.BRAVE_API_KEY }}
+          TAVILY_API_KEY: ${{ env.TAVILY_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ env.DEEPSEEK_API_KEY }}
+          LLM_API_KEY: ${{ env.LLM_API_KEY }}
+          GHCR_USER: ${{ env.GHCR_USER }}
+          GHCR_TOKEN: ${{ env.GHCR_TOKEN }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          envs: SCHEDULE_IMAGE,STACK_NAME,DEPLOY_PATH,TRAEFIK_HOST,TRAEFIK_ENTRYPOINTS,TRAEFIK_CERTRESOLVER,TRAEFIK_NETWORK,BANGUMI_UA,REFRESH_HOURS,MAX_SUBJECTS_PER_RUN,MAX_SEARCH_CALLS,MAX_LLM_CALLS,SEARCH_PROVIDER_ORDER,INCLUDE_PLATFORMS,SEASON_OVERRIDE,LOG_LEVEL,LLM_BASE_URL,LLM_MODEL,CACHE_MAX_BYTES,HISTORY_KEEP,UPDATE_SECRETS,ADMIN_TOKEN,BRAVE_API_KEY,TAVILY_API_KEY,DEEPSEEK_API_KEY,LLM_API_KEY,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            bash scripts/deploy-vps.sh
+      - name: Summary
+        run: |
+          echo "Deployed ${{ env.SCHEDULE_IMAGE }} to stack ${{ env.STACK_NAME }} on ${{ secrets.SSH_HOST }}"
+          echo "Health: https://${{ env.TRAEFIK_HOST }}/health"

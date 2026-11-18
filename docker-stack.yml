@@ -1,0 +1,117 @@
+# AirRadar - Docker Swarm stack (deployed with docker stack deploy).
+#
+# Client-side variable interpolation is performed by docker stack deploy from
+# the environment exported by scripts/deploy-vps.sh.
+# Required: TRAEFIK_HOST. Optional: TRAEFIK_ENTRYPOINTS, TRAEFIK_CERTRESOLVER,
+# TRAEFIK_NETWORK, SCHEDULE_IMAGE and the tuning variables below.
+
+services:
+  airradar:
+    image: ${SCHEDULE_IMAGE:-ghcr.io/moderras/airradar:latest}
+    environment:
+      PORT: "8080"
+      DATA_DIR: "/data"
+      CACHE_DIR: "/data/cache"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      MALLOC_ARENA_MAX: "2"
+      BANGUMI_UA: "${BANGUMI_UA:-AirRadar/0.1.0 (+https://github.com/ModerRAS/AirRadar)}"
+      REFRESH_HOURS: "${REFRESH_HOURS:-6}"
+      MAX_SUBJECTS_PER_RUN: "${MAX_SUBJECTS_PER_RUN:-30}"
+      MAX_SEARCH_CALLS: "${MAX_SEARCH_CALLS:-60}"
+      MAX_LLM_CALLS: "${MAX_LLM_CALLS:-10}"
+      SEARCH_PROVIDER_ORDER: "${SEARCH_PROVIDER_ORDER:-brave,tavily,deepseek}"
+      INCLUDE_PLATFORMS: "${INCLUDE_PLATFORMS:-TV,WEB}"
+      SEASON_OVERRIDE: "${SEASON_OVERRIDE:-}"
+      CACHE_MAX_BYTES: "${CACHE_MAX_BYTES:-268435456}"
+      HISTORY_KEEP: "${HISTORY_KEEP:-10}"
+      DEEPSEEK_SEARCH_URL: "${DEEPSEEK_SEARCH_URL:-https://api.deepseek.com/v1/chat/completions}"
+      DEEPSEEK_SEARCH_MODEL: "${DEEPSEEK_SEARCH_MODEL:-deepseek-chat}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      ADMIN_TOKEN_FILE: /run/secrets/airradar_admin_token
+      BRAVE_API_KEY_FILE: /run/secrets/airradar_brave_api_key
+      TAVILY_API_KEY_FILE: /run/secrets/airradar_tavily_api_key
+      DEEPSEEK_API_KEY_FILE: /run/secrets/airradar_deepseek_api_key
+      LLM_API_KEY_FILE: /run/secrets/airradar_llm_api_key
+    secrets:
+      - airradar_admin_token
+      - airradar_brave_api_key
+      - airradar_tavily_api_key
+      - airradar_deepseek_api_key
+      - airradar_llm_api_key
+    volumes:
+      - airradar_data:/data
+    networks:
+      - traefik-public
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/airradar", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 0
+        window: 120s
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        delay: 10s
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: continue
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.50"
+        reservations:
+          memory: 32M
+          cpus: "0.10"
+      labels:
+        - traefik.enable=true
+        - traefik.docker.network=${TRAEFIK_NETWORK:-traefik-public}
+        - traefik.http.routers.airradar.rule=Host(${TRAEFIK_HOST})
+        - traefik.http.routers.airradar.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}
+        - traefik.http.routers.airradar.tls=true
+        - traefik.http.routers.airradar.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+        - traefik.http.services.airradar.loadbalancer.server.port=8080
+        - traefik.http.services.airradar.loadbalancer.healthcheck.path=/health
+        - traefik.http.services.airradar.loadbalancer.healthcheck.interval=30s
+
+networks:
+  traefik-public:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik-public}
+
+volumes:
+  airradar_data:
+    driver: local
+
+# External secrets must exist before the first deploy; scripts/deploy-vps.sh
+# creates them idempotently and never prints their contents.
+secrets:
+  airradar_admin_token:
+    external: true
+    name: ${SECRET_PREFIX:-airradar}_admin_token
+  airradar_brave_api_key:
+    external: true
+    name: ${SECRET_PREFIX:-airradar}_brave_api_key
+  airradar_tavily_api_key:
+    external: true
+    name: ${SECRET_PREFIX:-airradar}_tavily_api_key
+  airradar_deepseek_api_key:
+    external: true
+    name: ${SECRET_PREFIX:-airradar}_deepseek_api_key
+  airradar_llm_api_key:
+    external: true
+    name: ${SECRET_PREFIX:-airradar}_llm_api_key

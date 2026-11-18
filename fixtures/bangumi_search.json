@@ -1,0 +1,76 @@
+{
+  "data": [
+    {
+      "id": 393010,
+      "name": "探偵はもう、死んでいる。 Season 2",
+      "name_cn": "侦探已经死了。 第二季",
+      "date": "2026-10-07",
+      "platform": "TV",
+      "images": {
+        "large": "https://lain.bgm.tv/pic/cover/l/xx.jpg",
+        "common": "https://lain.bgm.tv/pic/cover/c/xx.jpg"
+      },
+      "infobox": [
+        {
+          "key": "中文名",
+          "value": "侦探已经死了。 第二季"
+        },
+        {
+          "key": "放送开始",
+          "value": "2026年10月7日"
+        },
+        {
+          "key": "放送星期",
+          "value": "星期三"
+        },
+        {
+          "key": "官方网站",
+          "value": "https://tanmoshi-anime.jp/Season2/"
+        }
+      ]
+    },
+    {
+      "id": 390200,
+      "name": "列女战纪：女娲石记",
+      "name_cn": "列女战纪：女娲石记",
+      "date": "2026-10-05",
+      "platform": "WEB",
+      "images": {
+        "large": "https://lain.bgm.tv/pic/cover/l/yy.jpg"
+      },
+      "infobox": [
+        {
+          "key": "放送开始",
+          "value": "2026年10月5日"
+        },
+        {
+          "key": "官方网站",
+          "value": [
+            {
+              "v": "https://example.com/lienv"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 349497,
+      "name": "Wildwood",
+      "name_cn": "荒野丛林",
+      "date": "2026-10-23",
+      "platform": "剧场版",
+      "images": {
+        "common": "https://lain.bgm.tv/pic/cover/c/zz.jpg"
+      },
+      "infobox": [
+        {
+          "key": "上映年度",
+          "value": "2026年10月23日"
+        }
+      ]
+    }
+  ],
+  "total": 3,
+  "limit": 100,
+  "offset": 0
+}

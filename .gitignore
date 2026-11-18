@@ -1,0 +1,22 @@
+# build artifacts
+/target/
+**/*.rs.bk
+
+# local runtime data (state / schedule / cache / history)
+/data/
+/scratch/
+
+# local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# logs
+*.log

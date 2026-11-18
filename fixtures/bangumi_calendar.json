@@ -1,0 +1,40 @@
+[
+  {
+    "weekday": {
+      "en": "Wed",
+      "cn": "星期三",
+      "ja": "水曜日",
+      "id": 3
+    },
+    "items": [
+      {
+        "id": 393010,
+        "name": "探偵はもう、死んでいる。 Season 2",
+        "name_cn": "侦探已经死了。 第二季",
+        "air_date": "2026-10-07",
+        "air_weekday": 3,
+        "images": {
+          "large": "https://lain.bgm.tv/pic/cover/l/xx.jpg"
+        }
+      }
+    ]
+  },
+  {
+    "weekday": {
+      "en": "Sat",
+      "cn": "星期六",
+      "ja": "土曜日",
+      "id": 6
+    },
+    "items": [
+      {
+        "id": 111111,
+        "name": "夏休みの怪物",
+        "name_cn": "",
+        "air_date": "2026-07-04",
+        "air_weekday": 6,
+        "images": {}
+      }
+    ]
+  }
+]
