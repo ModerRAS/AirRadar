@@ -106,19 +106,55 @@ wait_for_stack_removal() {
   die "stack $STACK_NAME did not finish removing within 120s"
 }
 
-if [ "$UPDATE_SECRETS" = "1" ]; then
-  log "UPDATE_SECRETS=1: removing stack so secrets can be rotated (brief downtime)"
+secret_fingerprint() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+fingerprint_file="$DEPLOY_PATH/.secret-fingerprints"
+
+rotate_secrets() {
+  log "$1: removing stack so secrets can be rotated (brief downtime)"
   docker stack rm "$STACK_NAME" >/dev/null 2>&1 || true
   wait_for_stack_removal
+  local entry
+  for entry in "${secret_entries[@]}"; do
+    docker secret rm "$(secret_name "${entry%%:*}")" >/dev/null 2>&1 || true
+  done
+}
+
+rotate=0
+if [ "$UPDATE_SECRETS" = "1" ]; then
+  rotate=1
+elif [ ! -f "$fingerprint_file" ]; then
+  # First deploy with fingerprint tracking: sync once so pre-existing secrets
+  # (created by older versions of this script) match the current values.
+  log "no secret fingerprints yet; synchronising all secrets once"
+  rotate=1
+else
   for entry in "${secret_entries[@]}"; do
     name="${entry%%:*}"
-    docker secret rm "$(secret_name "$name")" >/dev/null 2>&1 || true
+    current="$(secret_fingerprint "${entry#*:}")"
+    recorded="$(grep -E "^${name}=" "$fingerprint_file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+    if [ "$recorded" != "$current" ]; then
+      log "secret $(secret_name "$name") changed since the last deploy"
+      rotate=1
+    fi
   done
+fi
+
+if [ "$rotate" = "1" ]; then
+  rotate_secrets "secret rotation"
 fi
 
 for entry in "${secret_entries[@]}"; do
   ensure_secret "${entry%%:*}" "${entry#*:}"
 done
+
+# Persist value fingerprints (never the values themselves) so the next
+# deploy can detect GitHub secret changes and rotate automatically.
+mkdir -p "$DEPLOY_PATH"
+: > "$fingerprint_file"
+for entry in "${secret_entries[@]}"; do
+  printf '%s=%s\n' "${entry%%:*}" "$(secret_fingerprint "${entry#*:}")" >> "$fingerprint_file"
+done
+chmod 600 "$fingerprint_file" 2>/dev/null || true
 
 cd "$DEPLOY_PATH"
 [ -f docker-stack.yml ] || die "docker-stack.yml not found in $DEPLOY_PATH (upload it first)"
