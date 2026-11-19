@@ -1,4 +1,4 @@
-# AirRadar 鈥?self-hosted anime airing schedule index
+# AirRadar — self-hosted anime airing schedule index
 
 AirRadar answers one question for [MiruPlay](https://github.com/ModerRAS/MiruPlay):
 **when does the current anime season air in Japan?** It collects the season list
@@ -143,8 +143,8 @@ served verbatim by the API. Field names are camelCase:
   "items": [
     {
       "subjectId": 393010,
-      "name": "鎺㈠伒銇倐銇嗐€佹銈撱仹銇勩倠銆?Season 2",
-      "nameCn": "渚︽帰宸茬粡姝讳簡銆?绗簩瀛?,
+      "name": "探偵はもう、死んでいる。 Season 2",
+      "nameCn": "侦探已经死了。 第二季"
       "airDate": "2026-10-07",
       "weekday": 3,
       "time": "23:00",
@@ -198,15 +198,15 @@ Clients convert JST to the user's local time zone.
 
 The repository ships:
 
-- `Dockerfile` 鈥?multi-stage, Debian bookworm slim, non-root uid 10001,
+- `Dockerfile` — multi-stage, Debian bookworm slim, non-root uid 10001,
   `HEALTHCHECK` via `airradar --healthcheck`, `EXPOSE 8080`.
-- `docker-stack.yml` 鈥?1 replica, `restart_policy: any`, rolling update
+- `docker-stack.yml` — 1 replica, `restart_policy: any`, rolling update
   (`start-first`, rollback), healthcheck, 128 MB limit / 32 MB reservation,
   external `traefik-public` network, Traefik router labels, external docker
   secrets, named volume `/data`, json-file log rotation.
-- `.github/workflows/docker.yml` 鈥?tests + build & push to
+- `.github/workflows/docker.yml` — tests + build & push to
   `ghcr.io/moderras/airradar` (`latest` + `sha-<commit>`).
-- `.github/workflows/deploy.yml` 鈥?build -> push GHCR -> SSH to the VPS ->
+- `.github/workflows/deploy.yml` — build -> push GHCR -> SSH to the VPS ->
   create/rotate docker secrets -> `docker stack deploy --with-registry-auth`.
 
 Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
