@@ -79,8 +79,8 @@ jobs:
       INCLUDE_PLATFORMS: ${{ vars.INCLUDE_PLATFORMS || 'TV,WEB' }}
       SEASON_OVERRIDE: ${{ vars.SEASON_OVERRIDE || '' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'info' }}
-      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || '' }}
-      LLM_MODEL: ${{ vars.LLM_MODEL || '' }}
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL || vars.LLM_BASE_URL || '' }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL || vars.LLM_MODEL || '' }}
       LLM_SESSION_ID: ${{ vars.LLM_SESSION_ID || '' }}
       DEEPSEEK_SEARCH_URL: ${{ vars.DEEPSEEK_SEARCH_URL || 'https://api.deepseek.com/v1/chat/completions' }}
       DEEPSEEK_SEARCH_MODEL: ${{ vars.DEEPSEEK_SEARCH_MODEL || 'deepseek-chat' }}
