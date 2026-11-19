@@ -3,11 +3,21 @@
 //! A single batched OpenAI-compatible chat completion is attempted per run
 //! (bounded by MAX_LLM_CALLS). Results are cached in /data/llm-cache.json so a
 //! flaky model or a temporarily down gateway never blocks a run.
+//!
+//! OpenCode Go (base https://opencode.ai/inference/go/v1) requires an extra
+//! x-opencode-session header on every request: without it the gateway answers
+//! HTTP 400. The id is taken from LLM_SESSION_ID or generated once and persisted
+//! as DATA_DIR/llm-session-id, so all requests share a stable session.
+//!
+//! Search credentials (BRAVE/TAVILY/DEEPSEEK_API_KEY) and LLM credentials
+//! (LLM_API_KEY) are intentionally independent: this client only ever reads
+//! LLM_* settings.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -57,16 +67,28 @@ pub struct LlmRunStats {
     pub last_error: Option<String>,
 }
 
+/// Header required by the OpenCode Go gateway (missing header -> HTTP 400).
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Host fragment that identifies an OpenCode Go endpoint.
+pub const OPENCODE_HOST_MARKER: &str = "opencode.ai";
+
+/// Prefix used for auto-generated stable session ids.
+pub const SESSION_ID_PREFIX: &str = "airradar";
+
 /// OpenAI-compatible chat client used only for the extraction fallback.
 pub struct LlmClient {
     client: reqwest::Client,
     endpoint: String,
-    api_key: String,
     model: String,
     store: Arc<Store>,
     batch_size: usize,
     max_input_chars: usize,
     max_calls: usize,
+    /// x-opencode-session value; only set for OpenCode Go endpoints.
+    session_id: Option<String>,
+    /// Prebuilt headers applied to every request.
+    headers: HeaderMap,
 }
 
 impl LlmClient {
@@ -83,6 +105,16 @@ impl LlmClient {
         } else {
             format!("{}/chat/completions", base.trim_end_matches('/'))
         };
+        let api_key = cfg.llm_api_key.clone().unwrap_or_default();
+        let model = cfg.llm_model.clone().unwrap_or_default();
+        let session_id = if is_opencode_endpoint(&endpoint) {
+            let session_id = resolve_llm_session_id(&store, cfg.llm_session_id.as_deref());
+            log::info("OpenCode Go endpoint detected; x-opencode-session header enabled");
+            Some(session_id)
+        } else {
+            None
+        };
+        let headers = build_llm_headers(&endpoint, &api_key, session_id.as_deref())?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -90,12 +122,13 @@ impl LlmClient {
         Ok(Some(LlmClient {
             client,
             endpoint,
-            api_key: cfg.llm_api_key.clone().unwrap_or_default(),
-            model: cfg.llm_model.clone().unwrap_or_default(),
+            model,
             store,
             batch_size: cfg.llm_batch_size.max(1),
             max_input_chars: cfg.llm_max_input_chars.max(200),
             max_calls: cfg.max_llm_calls,
+            session_id,
+            headers,
         }))
     }
 
@@ -105,6 +138,20 @@ impl LlmClient {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Resolved x-opencode-session value (only set for OpenCode Go endpoints).
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Headers applied to every chat completion request.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn is_opencode(&self) -> bool {
+        is_opencode_endpoint(&self.endpoint)
     }
 
     /// Resolve suggestions for the given requests, using the on-disk result
@@ -203,8 +250,7 @@ impl LlmClient {
         let response = self
             .client
             .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Accept", "application/json")
+            .headers(self.headers.clone())
             .json(&body)
             .send()
             .await
@@ -246,6 +292,69 @@ pub fn cache_key(request: &LlmRequest) -> String {
         request.subject_id,
         hash_hex(&format!("{}|{}", request.title, request.text))
     )
+}
+
+/// True when the endpoint host points at the OpenCode Go gateway.
+pub fn is_opencode_endpoint(endpoint: &str) -> bool {
+    crate::util::url_host(endpoint)
+        .map(|host| host.contains(OPENCODE_HOST_MARKER))
+        .unwrap_or(false)
+}
+
+/// Generate a stable-looking session id for gateways that require one.
+pub fn generate_session_id() -> String {
+    format!("{SESSION_ID_PREFIX}-{:016x}", crate::util::random_u64())
+}
+
+/// Resolve the OpenCode Go session id: explicit LLM_SESSION_ID wins, then the
+/// value persisted in DATA_DIR/llm-session-id, then a freshly generated id that
+/// is persisted for later runs. Persistence errors are logged, never fatal.
+pub fn resolve_llm_session_id(store: &Store, configured: Option<&str>) -> String {
+    if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    match store.load_llm_session_id() {
+        Ok(Some(value)) => return value,
+        Ok(None) => {}
+        Err(error) => log::warn(format!("llm session id read failed: {error}")),
+    }
+    let generated = generate_session_id();
+    match store.save_llm_session_id(&generated) {
+        Ok(()) => log::info("generated and persisted stable LLM session id in the data dir"),
+        Err(error) => log::warn(format!("llm session id persist failed: {error}")),
+    }
+    generated
+}
+
+/// Build the headers for an OpenAI-compatible chat endpoint.
+///
+/// Always sends Authorization (Bearer LLM_API_KEY) and Accept. OpenCode Go
+/// endpoints additionally require x-opencode-session; a missing/invalid session
+/// id is a configuration error rather than a silent HTTP 400 later.
+pub fn build_llm_headers(
+    endpoint: &str,
+    api_key: &str,
+    session_id: Option<&str>,
+) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|error| format!("invalid LLM_API_KEY header value: {error}"))?,
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    if is_opencode_endpoint(endpoint) {
+        let session_id = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "OpenCode Go endpoint requires a session id".to_string())?;
+        headers.insert(
+            OPENCODE_SESSION_HEADER,
+            HeaderValue::from_str(session_id)
+                .map_err(|error| format!("invalid LLM session id header value: {error}"))?,
+        );
+    }
+    Ok(headers)
 }
 
 fn strip_code_fence(input: &str) -> &str {
@@ -475,5 +584,270 @@ mod tests {
     fn system_prompt_documents_rules() {
         assert!(SYSTEM_PROMPT.contains("weekday"));
         assert!(SYSTEM_PROMPT.contains("Never invent"));
+    }
+
+    #[test]
+    fn detects_opencode_endpoints() {
+        assert!(is_opencode_endpoint(
+            "https://opencode.ai/inference/go/v1/chat/completions"
+        ));
+        assert!(is_opencode_endpoint(
+            "http://opencode.ai:8080/inference/go/v1/chat/completions"
+        ));
+        assert!(!is_opencode_endpoint(
+            "https://api.openai.com/v1/chat/completions"
+        ));
+        assert!(!is_opencode_endpoint(
+            "http://127.0.0.1:9/v1/chat/completions"
+        ));
+        assert!(!is_opencode_endpoint("not a url"));
+    }
+
+    #[test]
+    fn opencode_endpoint_gets_session_header() {
+        let headers = build_llm_headers(
+            "https://opencode.ai/inference/go/v1/chat/completions",
+            "opencode-go-key",
+            Some("session-abc"),
+        )
+        .unwrap();
+        assert_eq!(
+            headers
+                .get(OPENCODE_SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "session-abc"
+        );
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer opencode-go-key"
+        );
+        assert_eq!(
+            headers.get(ACCEPT).unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn generic_endpoint_has_no_session_header() {
+        let headers = build_llm_headers(
+            "https://api.openai.com/v1/chat/completions",
+            "llm-key",
+            Some("should-be-ignored"),
+        )
+        .unwrap();
+        assert!(headers.get(OPENCODE_SESSION_HEADER).is_none());
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer llm-key"
+        );
+    }
+
+    #[test]
+    fn opencode_endpoint_requires_session_id() {
+        let error = build_llm_headers(
+            "https://opencode.ai/inference/go/v1/chat/completions",
+            "key",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("session id"), "error: {error}");
+    }
+
+    #[test]
+    fn rejects_invalid_session_id_header() {
+        let error = build_llm_headers(
+            "https://opencode.ai/inference/go/v1/chat/completions",
+            "key",
+            Some("bad\nsession"),
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid LLM session id"), "error: {error}");
+    }
+
+    #[test]
+    fn resolves_explicit_and_persisted_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        assert_eq!(
+            resolve_llm_session_id(&store, Some("explicit-id")),
+            "explicit-id"
+        );
+        assert!(
+            store.load_llm_session_id().unwrap().is_none(),
+            "explicit session ids are not persisted"
+        );
+
+        let generated = resolve_llm_session_id(&store, None);
+        assert!(
+            generated.starts_with(SESSION_ID_PREFIX),
+            "generated: {generated}"
+        );
+        assert_eq!(
+            store.load_llm_session_id().unwrap().as_deref(),
+            Some(generated.as_str())
+        );
+        // Stable across calls and restarts.
+        assert_eq!(resolve_llm_session_id(&store, None), generated);
+        assert_eq!(resolve_llm_session_id(&store, None), generated);
+    }
+
+    #[test]
+    fn from_config_wires_stable_opencode_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        let mut cfg = Config::for_tests(PathBuf::from(dir.path()));
+        cfg.llm_base_url = Some("https://opencode.ai/inference/go/v1".to_string());
+        cfg.llm_api_key = Some("opencode-go-key".to_string());
+        cfg.llm_model = Some("model".to_string());
+
+        let client = LlmClient::from_config(&cfg, store.clone())
+            .unwrap()
+            .unwrap();
+        assert!(client.is_opencode());
+        let session_id = client.session_id().unwrap().to_string();
+        assert!(session_id.starts_with(SESSION_ID_PREFIX));
+        assert_eq!(
+            client
+                .headers()
+                .get(OPENCODE_SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            session_id
+        );
+        assert_eq!(
+            store.load_llm_session_id().unwrap().as_deref(),
+            Some(session_id.as_str())
+        );
+
+        // A restart reuses the persisted id instead of generating a new one.
+        let second = LlmClient::from_config(&cfg, store).unwrap().unwrap();
+        assert_eq!(second.session_id(), Some(session_id.as_str()));
+    }
+
+    #[test]
+    fn explicit_session_id_overrides_persisted_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        store.save_llm_session_id("persisted-id").unwrap();
+        let mut cfg = Config::for_tests(PathBuf::from(dir.path()));
+        cfg.llm_base_url = Some("https://opencode.ai/inference/go/v1".to_string());
+        cfg.llm_api_key = Some("key".to_string());
+        cfg.llm_model = Some("model".to_string());
+        cfg.llm_session_id = Some("explicit-id".to_string());
+        let client = LlmClient::from_config(&cfg, store).unwrap().unwrap();
+        assert_eq!(client.session_id(), Some("explicit-id"));
+        assert_eq!(
+            client
+                .headers()
+                .get(OPENCODE_SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "explicit-id"
+        );
+    }
+
+    #[test]
+    fn llm_never_falls_back_to_search_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        let mut cfg = Config::for_tests(PathBuf::from(dir.path()));
+        cfg.deepseek_api_key = Some("deepseek-search-key".to_string());
+        cfg.brave_api_key = Some("brave-search-key".to_string());
+        cfg.llm_base_url = Some("https://opencode.ai/inference/go/v1".to_string());
+        cfg.llm_model = Some("model".to_string());
+        cfg.llm_api_key = None;
+        assert!(!cfg.has_llm());
+        assert!(
+            LlmClient::from_config(&cfg, store).unwrap().is_none(),
+            "search keys must never satisfy the LLM configuration"
+        );
+    }
+
+    #[test]
+    fn llm_authorization_uses_only_llm_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        let mut cfg = Config::for_tests(PathBuf::from(dir.path()));
+        cfg.llm_base_url = Some("https://api.openai.com/v1".to_string());
+        cfg.llm_api_key = Some("opencode-go-key".to_string());
+        cfg.llm_model = Some("model".to_string());
+        cfg.deepseek_api_key = Some("deepseek-search-key".to_string());
+        cfg.brave_api_key = Some("brave-search-key".to_string());
+        let client = LlmClient::from_config(&cfg, store).unwrap().unwrap();
+        assert_eq!(
+            client
+                .headers()
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer opencode-go-key"
+        );
+        assert!(!client.is_opencode());
+        assert!(client.session_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn sends_bearer_header_over_the_wire_and_omits_session_for_generic_endpoint() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Guard against regressions that would otherwise hang the test run.
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let request = String::from_utf8_lossy(&buffer).to_ascii_lowercase();
+            let content = r#"{"results":[{"id":1,"weekday":6,"time":"23:30"}]}"#;
+            let body = json!({ "choices": [{ "message": { "content": content } }] }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        let mut cfg = Config::for_tests(PathBuf::from(dir.path()));
+        cfg.llm_base_url = Some(format!("http://{address}/v1"));
+        cfg.llm_api_key = Some("test-llm-key".to_string());
+        cfg.llm_model = Some("test-model".to_string());
+        cfg.max_llm_calls = 1;
+        let client = LlmClient::from_config(&cfg, store).unwrap().unwrap();
+        let (suggestions, stats) = client.extract(&[request(1, "毎週土曜 23:30 放送")]).await;
+        let request_text = server.join().unwrap();
+        assert!(
+            request_text.contains("authorization: bearer test-llm-key"),
+            "request: {request_text}"
+        );
+        assert!(
+            request_text.contains("accept: application/json"),
+            "request: {request_text}"
+        );
+        assert!(
+            !request_text.contains(OPENCODE_SESSION_HEADER),
+            "generic endpoints must not send the OpenCode session header: {request_text}"
+        );
+        assert_eq!(stats.calls, 1);
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0].weekday, Some(6));
     }
 }

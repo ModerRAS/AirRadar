@@ -122,6 +122,9 @@ pub struct Config {
     pub llm_base_url: Option<String>,
     pub llm_api_key: Option<String>,
     pub llm_model: Option<String>,
+    /// Optional OpenCode Go session id; when unset a stable id is generated and
+    /// persisted under DATA_DIR/llm-session-id.
+    pub llm_session_id: Option<String>,
     pub llm_batch_size: usize,
     pub llm_max_input_chars: usize,
     pub max_llm_calls: usize,
@@ -266,6 +269,7 @@ impl Config {
         let llm_base_url = text(&map, "LLM_BASE_URL");
         let llm_api_key = secret(&map, "LLM_API_KEY")?;
         let llm_model = text(&map, "LLM_MODEL");
+        let llm_session_id = text(&map, "LLM_SESSION_ID");
 
         Ok(Config {
             port: parse_or(&map, "PORT", 8080u16)?,
@@ -288,6 +292,7 @@ impl Config {
             llm_base_url,
             llm_api_key,
             llm_model,
+            llm_session_id,
             llm_batch_size,
             llm_max_input_chars,
             max_llm_calls,
@@ -333,6 +338,7 @@ impl Config {
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,
+            llm_session_id: None,
             llm_batch_size: 5,
             llm_max_input_chars: 1200,
             max_llm_calls: 0,
@@ -473,6 +479,19 @@ mod tests {
         .unwrap();
         assert!(config.admin_token.is_none());
         assert!(!config.admin_enabled());
+    }
+
+    #[test]
+    fn llm_session_id_is_optional() {
+        let config = Config::from_pairs(&[]).unwrap();
+        assert!(config.llm_session_id.is_none());
+
+        let config = Config::from_pairs(&pairs(&[("LLM_SESSION_ID", "  session-abc  ")])).unwrap();
+        assert_eq!(config.llm_session_id.as_deref(), Some("session-abc"));
+
+        // Blank means unset -> a stable id will be generated and persisted.
+        let config = Config::from_pairs(&pairs(&[("LLM_SESSION_ID", "   ")])).unwrap();
+        assert!(config.llm_session_id.is_none());
     }
 
     #[test]
