@@ -18,6 +18,24 @@ die() { log "ERROR: $*"; exit 1; }
 : "${DEPLOY_PATH:=$(pwd)}"
 : "${SCHEDULE_IMAGE:?SCHEDULE_IMAGE is required (e.g. ghcr.io/moderras/airradar:sha-ab12cd3)}"
 : "${TRAEFIK_HOST:?TRAEFIK_HOST is required (e.g. schedule.example.com)}"
+# Normalise TRAEFIK_HOST: tolerate values pasted with scheme, path, port,
+# quotes or whitespace so the Traefik Host() rule never gets an invalid hostname.
+TRAEFIK_HOST="$(printf '%s' "$TRAEFIK_HOST" | tr -d '[:space:]')"
+DQ='"'
+SQ="'"
+TRAEFIK_HOST="${TRAEFIK_HOST//$DQ/}"
+TRAEFIK_HOST="${TRAEFIK_HOST//$SQ/}"
+TRAEFIK_HOST="${TRAEFIK_HOST#http://}"
+TRAEFIK_HOST="${TRAEFIK_HOST#https://}"
+TRAEFIK_HOST="${TRAEFIK_HOST%%/*}"
+TRAEFIK_HOST="${TRAEFIK_HOST%:*}"
+TRAEFIK_HOST="$(printf '%s' "$TRAEFIK_HOST" | tr '[:upper:]' '[:lower:]')"
+TRAEFIK_HOST="${TRAEFIK_HOST%.}"
+case "$TRAEFIK_HOST" in
+  ""|*[!a-z0-9.-]*|.*|*.|*..*) die "TRAEFIK_HOST must be a bare hostname like schedule.example.com (no scheme, path, port, quotes or spaces)" ;;
+esac
+[[ "$TRAEFIK_HOST" == *.* ]] || die "TRAEFIK_HOST must be a fully qualified domain name (e.g. schedule.example.com)"
+export TRAEFIK_HOST
 : "${TRAEFIK_ENTRYPOINTS:=websecure}"
 : "${TRAEFIK_CERTRESOLVER:=letsencrypt}"
 : "${TRAEFIK_NETWORK:=traefik-public}"
