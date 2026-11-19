@@ -237,6 +237,7 @@ to follow progress.
 | `/data/status.json` | Last run summary (served inside `/api/status`) |
 | `/data/review.json`, `/data/review.md` | Review queue: conflicts + missing times, with evidence |
 | `/data/llm-cache.json` | LLM fallback result cache (only when `LLM_*` configured) |
+| `/data/llm-session-id` | Stable OpenCode Go session id (auto-generated when `LLM_SESSION_ID` is empty) |
 | `/data/cache/` | Fetched page cache (256 MB LRU by default) |
 
 All JSON writes go through a temporary file + fsync + atomic rename, so readers

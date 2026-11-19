@@ -89,12 +89,13 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `SEARCH_TIMEOUT_SECS` | `20` | Per search request timeout |
 | `BRAVE_API_KEY` / `_FILE` | unset | Brave Search API key |
 | `TAVILY_API_KEY` / `_FILE` | unset | Tavily Search API key |
-| `DEEPSEEK_API_KEY` / `_FILE` | unset | DeepSeek search key (OpenAI-compatible chat endpoint) |
+| `DEEPSEEK_API_KEY` / `_FILE` | unset | DeepSeek **search** key (independent from the OpenCode Go LLM key) |
 | `DEEPSEEK_SEARCH_URL` | `https://api.deepseek.com/v1/chat/completions` | DeepSeek search endpoint |
 | `DEEPSEEK_SEARCH_MODEL` | `deepseek-chat` | DeepSeek search model |
 | `LLM_BASE_URL` | unset | OpenAI-compatible extraction fallback base URL |
-| `LLM_API_KEY` / `_FILE` | unset | Extraction fallback API key |
-| `LLM_MODEL` | unset | Extraction fallback model (all three LLM_* must be set) |
+| `LLM_API_KEY` / `_FILE` | unset | Extraction fallback key (OpenCode Go subscription key; independent from search keys) |
+| `LLM_MODEL` | unset | Extraction fallback model (all three of LLM_BASE_URL/LLM_API_KEY/LLM_MODEL must be set) |
+| `LLM_SESSION_ID` | empty | OpenCode Go session id; when empty a stable id is generated and persisted in `DATA_DIR/llm-session-id` |
 | `LLM_BATCH_SIZE` | `5` | Subjects per LLM request |
 | `MAX_LLM_CALLS` | `10` | LLM request budget per run |
 | `LLM_MAX_INPUT_CHARS` | `1200` | Text sent per subject to the LLM |
@@ -110,6 +111,50 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `STATE_RETENTION_SEASONS` | `4` | Seasons retained in `state.json` |
 | `PUBLISH_MEDIUM` | `true` | `false` publishes only high-confidence rows and sends medium to review |
 | `MAX_CANDIDATES_PER_SUBJECT` | `40` | Cap on stored candidate observations |
+
+### Credentials: search vs LLM (independent)
+
+AirRadar uses two independent credential sets and never mixes them:
+
+| Purpose | Variables |
+| --- | --- |
+| Web search / discovery (snippets, URLs, pages) | `SEARCH_PROVIDER_ORDER`, `DEEPSEEK_API_KEY` (+ optional `DEEPSEEK_SEARCH_URL`/`DEEPSEEK_SEARCH_MODEL`), `BRAVE_API_KEY`, `TAVILY_API_KEY` |
+| LLM extraction fallback (rules failed) | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_SESSION_ID` |
+
+Example setup with DeepSeek search + OpenCode Go LLM:
+
+```bash
+# search: its own DeepSeek key
+SEARCH_PROVIDER_ORDER=deepseek
+DEEPSEEK_API_KEY=<DeepSeek search key>
+DEEPSEEK_SEARCH_URL=https://api.deepseek.com/v1/chat/completions
+DEEPSEEK_SEARCH_MODEL=deepseek-chat
+
+# LLM fallback: OpenCode Go subscription (never the DeepSeek search key)
+LLM_BASE_URL=https://opencode.ai/inference/go/v1
+LLM_API_KEY=<OpenCode Go subscription key>
+LLM_MODEL=<OpenCode Go model id>
+LLM_SESSION_ID=                     # optional; auto-generated when empty
+```
+
+The search router only reads the search keys; the LLM client only reads
+`LLM_*`. Setting one group never enables the other.
+
+### OpenCode Go (LLM extraction fallback)
+
+- Base URL: `https://opencode.ai/inference/go/v1` (OpenAI-compatible
+  `/chat/completions`; the Anthropic-style base is not used by AirRadar).
+- Auth: `Authorization: Bearer $LLM_API_KEY`.
+- Session header: the OpenCode Go gateway **requires**
+  `x-opencode-session: <sessionId>` on every request and answers HTTP 400
+  without it. AirRadar adds the header automatically when the endpoint host
+  contains `opencode.ai` (other OpenAI-compatible endpoints do not get it).
+- Session id resolution: explicit `LLM_SESSION_ID` → persisted
+  `DATA_DIR/llm-session-id` → generated once and written atomically. The id is
+  stable across restarts and redeploys because `/data` is a Docker volume.
+  It is a routing id, not a secret, and is never printed with a key.
+- Enable the fallback with all three of `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`;
+  `MAX_LLM_CALLS` and `LLM_BATCH_SIZE` bound cost.
 
 ## Season naming
 
@@ -208,6 +253,8 @@ The repository ships:
   `ghcr.io/moderras/airradar` (`latest` + `sha-<commit>`).
 - `.github/workflows/deploy.yml` — build -> push GHCR -> SSH to the VPS ->
   create/rotate docker secrets -> `docker stack deploy --with-registry-auth`.
+  It also passes `LLM_SESSION_ID` and `DEEPSEEK_SEARCH_URL`/`DEEPSEEK_SEARCH_MODEL`
+  through when configured (search and LLM credentials stay independent).
 
 Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 
@@ -218,7 +265,7 @@ Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 | `SSH_HOST` | yes | VPS host/IP of the Swarm manager |
 | `SSH_USER` | yes | SSH user with docker access (usually `root` or a docker-group user) |
 | `SSH_KEY` | yes | Private SSH key (OpenSSH format) for that user |
-| `SSH_PORT` | no | SSH port (default 22) |
+| `SSH_PORT` | no | SSH port. **Must be set if your SSH port is not 22** (default 22) |
 | `GHCR_USER` | no | GHCR username for the remote `docker login` (default: repository owner) |
 | `GHCR_TOKEN` | private image: yes | PAT with `read:packages`; only needed if the GHCR package is private |
 | `TRAEFIK_HOST` | yes | Public hostname, e.g. `schedule.example.com` (used in the Traefik `Host()` rule) |
@@ -228,8 +275,8 @@ Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 | `ADMIN_TOKEN` | yes | Bearer token for `/admin/refresh` (long random string) |
 | `BRAVE_API_KEY` | recommended | Brave Search key (at least one search provider is strongly recommended) |
 | `TAVILY_API_KEY` | optional | Tavily Search key |
-| `DEEPSEEK_API_KEY` | optional | DeepSeek search key |
-| `LLM_API_KEY` | optional | LLM extraction fallback key |
+| `DEEPSEEK_API_KEY` | optional | DeepSeek **search** key (independent from the OpenCode Go LLM key) |
+| `LLM_API_KEY` | optional | OpenCode Go / OpenAI-compatible extraction key (independent from search keys) |
 
 ### GitHub environment `production` - variables (optional)
 
@@ -242,10 +289,12 @@ Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 | `REFRESH_HOURS` | `6` | Collection interval |
 | `MAX_SUBJECTS_PER_RUN` | `30` | Processing window |
 | `MAX_SEARCH_CALLS` / `MAX_LLM_CALLS` | `60` / `10` | Per-run API budgets |
-| `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search fallback order |
+| `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search fallback order (for DeepSeek-only search use `deepseek`) |
+| `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_MODEL` | DeepSeek defaults | DeepSeek search endpoint/model |
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platform filter |
 | `SEASON_OVERRIDE` | empty | Force a season |
-| `LLM_BASE_URL` / `LLM_MODEL` | empty | LLM fallback endpoint/model (key stays a secret) |
+| `LLM_BASE_URL` / `LLM_MODEL` | empty | LLM fallback endpoint/model, e.g. OpenCode Go base (key stays a secret) |
+| `LLM_SESSION_ID` | empty | Optional OpenCode Go session id; auto-generated and persisted when empty |
 | `LOG_LEVEL` | `info` | Log verbosity |
 | `CACHE_MAX_BYTES` / `HISTORY_KEEP` | `268435456` / `10` | Disk caps |
 

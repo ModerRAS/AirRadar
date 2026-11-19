@@ -28,6 +28,7 @@ services:
       DEEPSEEK_SEARCH_MODEL: "${DEEPSEEK_SEARCH_MODEL:-deepseek-chat}"
       LLM_BASE_URL: "${LLM_BASE_URL:-}"
       LLM_MODEL: "${LLM_MODEL:-}"
+      LLM_SESSION_ID: "${LLM_SESSION_ID:-}"
       ADMIN_TOKEN_FILE: /run/secrets/airradar_admin_token
       BRAVE_API_KEY_FILE: /run/secrets/airradar_brave_api_key
       TAVILY_API_KEY_FILE: /run/secrets/airradar_tavily_api_key

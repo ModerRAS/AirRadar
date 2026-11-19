@@ -254,6 +254,8 @@ impl SearchRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
@@ -348,6 +350,36 @@ mod tests {
         assert_eq!(outcome.provider.as_deref(), Some("brave"));
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn search_does_not_fall_back_to_llm_key() {
+        let mut cfg = Config::for_tests(PathBuf::from("./data-test"));
+        cfg.search_order = vec![ProviderKind::Deepseek];
+        cfg.deepseek_api_key = None;
+        cfg.llm_base_url = Some("https://opencode.ai/inference/go/v1".to_string());
+        cfg.llm_api_key = Some("opencode-go-key".to_string());
+        cfg.llm_model = Some("model".to_string());
+        cfg.llm_session_id = Some("session".to_string());
+        let router = SearchRouter::from_config(&cfg).unwrap();
+        assert!(
+            router.is_empty(),
+            "the LLM key must never enable a search provider"
+        );
+        assert!(router.configured().is_empty());
+    }
+
+    #[test]
+    fn deepseek_search_only_reads_deepseek_key() {
+        let mut cfg = Config::for_tests(PathBuf::from("./data-test"));
+        cfg.search_order = vec![ProviderKind::Deepseek];
+        cfg.deepseek_api_key = Some("deepseek-search-key".to_string());
+        cfg.llm_base_url = Some("https://opencode.ai/inference/go/v1".to_string());
+        cfg.llm_api_key = Some("opencode-go-key".to_string());
+        cfg.llm_model = Some("model".to_string());
+        cfg.llm_session_id = Some("session".to_string());
+        let router = SearchRouter::from_config(&cfg).unwrap();
+        assert_eq!(router.configured(), vec!["deepseek"]);
     }
 
     #[tokio::test]

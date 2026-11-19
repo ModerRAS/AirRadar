@@ -70,7 +70,7 @@ secrets**:
 | `SSH_HOST` | yes | Swarm manager host/IP |
 | `SSH_USER` | yes | user allowed to run docker (`root` or docker-group user) |
 | `SSH_KEY` | yes | private key contents (OpenSSH), no passphrase or agent-loaded |
-| `SSH_PORT` | no | default `22` |
+| `SSH_PORT` | no | SSH port. **Must be set if your SSH port is not 22** (default `22`) |
 | `GHCR_USER` | no | default: repository owner |
 | `GHCR_TOKEN` | private image only | PAT with `read:packages` |
 | `TRAEFIK_HOST` | yes | e.g. `schedule.example.com` |
@@ -80,17 +80,52 @@ secrets**:
 | `ADMIN_TOKEN` | yes | long random string for `POST /admin/refresh` |
 | `BRAVE_API_KEY` | recommended | at least one search provider is strongly recommended |
 | `TAVILY_API_KEY` | optional | |
-| `DEEPSEEK_API_KEY` | optional | |
-| `LLM_API_KEY` | optional | extraction fallback key |
+| `DEEPSEEK_API_KEY` | optional | DeepSeek **search** key (independent from the OpenCode Go LLM key) |
+| `LLM_API_KEY` | optional | OpenCode Go / OpenAI-compatible extraction key (independent from search keys) |
 
 Optional **environment variables** (same effect as secrets, but non-secret):
 `STACK_NAME`, `DEPLOY_PATH`, `BANGUMI_UA`, `REFRESH_HOURS`,
 `MAX_SUBJECTS_PER_RUN`, `MAX_SEARCH_CALLS`, `MAX_LLM_CALLS`,
 `SEARCH_PROVIDER_ORDER`, `INCLUDE_PLATFORMS`, `SEASON_OVERRIDE`,
-`LLM_BASE_URL`, `LLM_MODEL`, `LOG_LEVEL`, `CACHE_MAX_BYTES`,
+`DEEPSEEK_SEARCH_URL`, `DEEPSEEK_SEARCH_MODEL`,
+`LLM_BASE_URL`, `LLM_MODEL`, `LLM_SESSION_ID`, `LOG_LEVEL`, `CACHE_MAX_BYTES`,
 `HISTORY_KEEP`, `TRAEFIK_HOST`/`TRAEFIK_ENTRYPOINTS`/`TRAEFIK_CERTRESOLVER`/`TRAEFIK_NETWORK`.
 
 Generate the admin token with something like `openssl rand -hex 32`.
+
+### 5.1 Credentials: search vs LLM (independent)
+
+Two separate credential groups; AirRadar never mixes them:
+
+| Purpose | GitHub secrets / variables | Notes |
+| --- | --- | --- |
+| Search / discovery | `SEARCH_PROVIDER_ORDER=deepseek`, `DEEPSEEK_API_KEY` (secret), optional `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_MODEL` (vars), `BRAVE_API_KEY`, `TAVILY_API_KEY` | Each provider uses its own key; none of these enables the LLM |
+| LLM extraction fallback | `LLM_BASE_URL` (var), `LLM_MODEL` (var), `LLM_SESSION_ID` (var, optional), `LLM_API_KEY` (secret) | Only `LLM_*`; never reuses search keys |
+
+OpenCode Go (LLM side; OpenAI-compatible base):
+
+```bash
+LLM_BASE_URL=https://opencode.ai/inference/go/v1
+LLM_API_KEY=<OpenCode Go subscription key>   # separate from DeepSeek search key
+LLM_MODEL=<OpenCode Go model id>
+LLM_SESSION_ID=                              # optional; auto-generated + persisted
+```
+
+The gateway requires `x-opencode-session` (HTTP 400 without it). AirRadar adds
+the header automatically when the endpoint host contains `opencode.ai`. When
+`LLM_SESSION_ID` is empty the service generates one and stores it as
+`/data/llm-session-id` in the data volume, so it remains stable across
+restarts and redeploys. The session id is not a secret and is never logged
+together with the key.
+
+DeepSeek search (search side):
+
+```bash
+SEARCH_PROVIDER_ORDER=deepseek
+DEEPSEEK_API_KEY=<DeepSeek search key>
+DEEPSEEK_SEARCH_URL=https://api.deepseek.com/v1/chat/completions
+DEEPSEEK_SEARCH_MODEL=deepseek-chat
+```
 
 ## 6. First deployment
 
@@ -100,7 +135,8 @@ Option A — CI (recommended): push to `main` or run the `deploy` workflow manua
 1. builds and pushes `sha-<7>` + `latest` to GHCR;
 2. SSHes to the VPS, creates the deploy directory;
 3. uploads `docker-stack.yml` and `scripts/deploy-vps.sh`;
-4. creates missing external docker secrets idempotently;
+4. creates missing external docker secrets idempotently and passes
+   `LLM_SESSION_ID` / `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_MODEL` through;
 5. runs `docker stack deploy --with-registry-auth --prune -c docker-stack.yml airradar`.
 
 Option B — manual from the VPS (no CI), see section 10.
@@ -158,8 +194,10 @@ Five **external** secrets are referenced by the stack:
 | `airradar_llm_api_key` | `LLM_API_KEY_FILE` | `LLM_API_KEY` |
 
 `scripts/deploy-vps.sh` creates any missing secret (empty optional keys are
-created as a single space, which AirRadar treats as unset). Create them
-manually when deploying without CI:
+created as a single space, which AirRadar treats as unset). `LLM_SESSION_ID` is
+not a docker secret: it is a routing id, and the generated value is persisted in
+the data volume (`/data/llm-session-id`). Only `LLM_API_KEY` is mounted as a
+secret. Create the secrets manually when deploying without CI:
 
 ```bash
 printf '%s' "$ADMIN_TOKEN" | docker secret create airradar_admin_token -
@@ -194,6 +232,12 @@ export TRAEFIK_CERTRESOLVER=letsencrypt
 export TRAEFIK_NETWORK=traefik-public
 export ADMIN_TOKEN='<long random token>'
 export BRAVE_API_KEY='<key>'
+export DEEPSEEK_API_KEY='<DeepSeek search key>'
+# Optional LLM extraction fallback (OpenCode Go; keys are independent from search)
+# export LLM_BASE_URL='https://opencode.ai/inference/go/v1'
+# export LLM_MODEL='<OpenCode Go model id>'
+# export LLM_API_KEY='<OpenCode Go subscription key>'
+# export LLM_SESSION_ID=''   # empty = generated and persisted in /data
 bash scripts/deploy-vps.sh
 ```
 

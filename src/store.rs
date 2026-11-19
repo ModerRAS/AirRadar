@@ -56,6 +56,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// File layout under DATA_DIR:
 /// - state.json, status.json, review.json, review.md, llm-cache.json
+/// - llm-session-id (stable OpenCode Go session id, plain text)
 /// - schedule/<season>.json, schedule/latest.json
 /// - history/<season>-<timestamp>.json
 /// - cache/ (owned by crate::cache::Cache)
@@ -90,6 +91,11 @@ impl Store {
 
     pub fn llm_cache_path(&self) -> PathBuf {
         self.data_dir.join("llm-cache.json")
+    }
+
+    /// Stable OpenCode Go session id used for the x-opencode-session header.
+    pub fn llm_session_id_path(&self) -> PathBuf {
+        self.data_dir.join("llm-session-id")
     }
 
     pub fn schedule_dir(&self) -> PathBuf {
@@ -219,6 +225,32 @@ impl Store {
 
     pub fn save_llm_cache(&self, cache: &HashMap<String, Value>) -> Result<()> {
         self.write_json(&self.llm_cache_path(), cache)
+    }
+
+    /// Load the persisted OpenCode Go session id, if any.
+    pub fn load_llm_session_id(&self) -> Result<Option<String>> {
+        let path = self.llm_session_id_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    /// Persist the OpenCode Go session id atomically. Empty ids are ignored so a
+    /// blank value can never wipe the stable id.
+    pub fn save_llm_session_id(&self, session_id: &str) -> Result<()> {
+        let trimmed = session_id.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        atomic_write(&self.llm_session_id_path(), trimmed.as_bytes())?;
+        Ok(())
     }
 }
 
@@ -454,6 +486,34 @@ mod tests {
         store.save_llm_cache(&cache).unwrap();
         let loaded = store.load_llm_cache().unwrap();
         assert_eq!(loaded.get("subject:1").unwrap()["weekday"], 6);
+    }
+
+    #[test]
+    fn llm_session_id_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        assert!(store.load_llm_session_id().unwrap().is_none());
+
+        store.save_llm_session_id("  airradar-abc123  ").unwrap();
+        assert_eq!(
+            store.load_llm_session_id().unwrap().as_deref(),
+            Some("airradar-abc123")
+        );
+        assert!(store.llm_session_id_path().exists());
+
+        // Survives a restart (a new Store instance on the same data dir).
+        let reopened = Store::new(dir.path().to_path_buf());
+        assert_eq!(
+            reopened.load_llm_session_id().unwrap().as_deref(),
+            Some("airradar-abc123")
+        );
+
+        // An empty value must not wipe the stable id.
+        store.save_llm_session_id("   ").unwrap();
+        assert_eq!(
+            store.load_llm_session_id().unwrap().as_deref(),
+            Some("airradar-abc123")
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 # Optional env: STACK_NAME, DEPLOY_PATH, TRAEFIK_ENTRYPOINTS, TRAEFIK_CERTRESOLVER,
 #               TRAEFIK_NETWORK, GHCR_USER, GHCR_TOKEN, UPDATE_SECRETS,
 #               ADMIN_TOKEN, BRAVE_API_KEY, TAVILY_API_KEY, DEEPSEEK_API_KEY,
-#               LLM_API_KEY, and the tuning variables used by docker-stack.yml.
+#               LLM_API_KEY, LLM_SESSION_ID, DEEPSEEK_SEARCH_URL, DEEPSEEK_SEARCH_MODEL,
+#               and the tuning variables used by docker-stack.yml.
 set -euo pipefail
 
 log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
@@ -36,6 +37,7 @@ export SEASON_OVERRIDE="${SEASON_OVERRIDE:-}"
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 export LLM_BASE_URL="${LLM_BASE_URL:-}"
 export LLM_MODEL="${LLM_MODEL:-}"
+export LLM_SESSION_ID="${LLM_SESSION_ID:-}"
 export DEEPSEEK_SEARCH_URL="${DEEPSEEK_SEARCH_URL:-https://api.deepseek.com/v1/chat/completions}"
 export DEEPSEEK_SEARCH_MODEL="${DEEPSEEK_SEARCH_MODEL:-deepseek-chat}"
 export CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-268435456}"
