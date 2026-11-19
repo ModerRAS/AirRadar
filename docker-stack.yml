@@ -81,7 +81,7 @@ services:
       labels:
         - traefik.enable=true
         - traefik.docker.network=${TRAEFIK_NETWORK:-traefik-public}
-        - traefik.http.routers.airradar.rule=Host(${TRAEFIK_HOST})
+        - traefik.http.routers.airradar.rule=Host(`${TRAEFIK_HOST}`)
         - traefik.http.routers.airradar.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}
         - traefik.http.routers.airradar.tls=true
         - traefik.http.routers.airradar.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
