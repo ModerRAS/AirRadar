@@ -158,6 +158,10 @@ chmod 600 "$fingerprint_file" 2>/dev/null || true
 
 cd "$DEPLOY_PATH"
 [ -f docker-stack.yml ] || die "docker-stack.yml not found in $DEPLOY_PATH (upload it first)"
+
+secret_fingerprint_short() { printf '%s' "$1" | sha256sum | cut -c1-8; }
+log "traefik config: host_len=${#TRAEFIK_HOST} host_sha=$(secret_fingerprint_short "$TRAEFIK_HOST") entrypoint=${TRAEFIK_ENTRYPOINTS} resolver=${TRAEFIK_CERTRESOLVER} network=${TRAEFIK_NETWORK}"
+if [ -z "$TRAEFIK_HOST" ]; then die "TRAEFIK_HOST is empty after normalisation"; fi
 log "deploying $SCHEDULE_IMAGE to stack $STACK_NAME"
 docker stack deploy --with-registry-auth --prune -c docker-stack.yml "$STACK_NAME"
 
@@ -171,4 +175,11 @@ done
 docker stack services "$STACK_NAME" || true
 docker service ps "$(printf '%s_airradar' "$STACK_NAME")" --no-trunc \
   --format '{{.Name}} {{.CurrentState}} {{.Error}}' 2>/dev/null | head -n 5 || true
+rule="$(docker service inspect "$(printf '%s_airradar' "$STACK_NAME")" \
+  --format '{{range $k, $v := .Spec.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' 2>/dev/null \
+  | grep 'traefik.http.routers.airradar.rule' || true)"
+log "rendered $rule"
+case "$rule" in
+  *'Host(`)'*|*'Host(``)'*|*"Host()"*) die "Traefik Host() rule rendered without a domain; check TRAEFIK_HOST on the server" ;;
+esac
 log "deployment finished; check https://$TRAEFIK_HOST/health"
