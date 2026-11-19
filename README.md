@@ -14,19 +14,19 @@ publishes a small JSON schedule with a JST weekday + clock time.
 ## How it works
 
 ```
-Bangumi API  鈹€鈹€鈻? subject list (season, id/name/name_cn/air_date/images)
-      鈹?      鈻?search providers (Brave / Tavily / DeepSeek, ordered fallback)
-      鈹? snippets + candidate URLs
-      鈻?HTTP fetch (rate limited, 4 concurrent, 15 s timeout, 200 KB cap, disk cache)
-      鈹? HTML -> plain text
-      鈻?rule extraction (JP/ZH/EN patterns)  鈹€鈹€鈻? optional LLM fallback (batched)
-      鈹?      鈻?cross-source verification (independence = domain)  鈹€鈹€鈻? confidence + review queue
-      鈹?      鈻?/data/state.json, /data/schedule/<season>.json, /data/review.{json,md}
+Bangumi API ──▶ subject list (season, id/name/name_cn/air_date/images)
+      ├─▶ search providers (Brave / Tavily / DeepSeek, ordered fallback)
+      ├─▶ snippets + candidate URLs
+      ├─▶ HTTP fetch (rate limited, 4 concurrent, 15 s timeout, 200 KB cap, disk cache)
+      ├─▶ HTML -> plain text
+      ├─▶ rule extraction (JP/ZH/EN patterns) ──▶ optional LLM fallback (batched)
+      ├─▶ cross-source verification (independence = domain) ──▶ confidence + review queue
+      └─▶ /data/state.json, /data/schedule/<season>.json, /data/review.{json,md}
 ```
 
 The service is a **resident web service** (Swarm service with
 restart_policy: any + healthcheck). The collector is **not a separate daemon**:
-the same process runs a tokio interval timer (`REFRESH_HOURS`, jitter 卤10%),
+the same process runs a tokio interval timer (`REFRESH_HOURS`, jitter ±10%),
 exposes `POST /admin/refresh`, and supports a one-shot `--once` CLI mode for
 manual jobs and debugging.
 
@@ -161,7 +161,7 @@ served verbatim by the API. Field names are camelCase:
 
 `weekday` is the **actual JST calendar day** (`1` = Monday ... `7` = Sunday) and
 `time` is `HH:MM` JST. Late-night Japanese notation is normalised to the real
-clock time: `鍦熸洔 25:15` and `鍦熸洔 娣卞1:15` both become **Sunday 01:15**.
+clock time: `土曜 25:15` and `土曜 深夜1:15` both become **Sunday 01:15**.
 Clients convert JST to the user's local time zone.
 
 ## Data quality & confidence
