@@ -348,7 +348,8 @@ mod tests {
             air_date: None,
             image: None,
             weekday: 3,
-            time: "23:00".to_string(),
+            time: Some("23:00".to_string()),
+            time_known: true,
             timezone: "Asia/Tokyo".to_string(),
             confidence: Confidence::High,
             sources: vec![ScheduleSource {

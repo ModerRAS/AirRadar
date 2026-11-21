@@ -211,14 +211,32 @@ const DEEPSEEK_SYSTEM_PROMPT: &str = concat!(
     "Return at most 8 results. Never invent URLs. Do not wrap the JSON in markdown fences."
 );
 
-/// DeepSeek-powered search. Works through any OpenAI-compatible chat endpoint
-/// (default https://api.deepseek.com/v1/chat/completions) and asks the model
-/// for structured search results.
+/// Default official DeepSeek search endpoint (POST /v1/tools/search).
+pub const DEEPSEEK_TOOLS_SEARCH_PATH: &str = "/tools/search";
+/// Legacy OpenAI-compatible chat endpoint (prompt-based pseudo search).
+pub const DEEPSEEK_CHAT_PATH: &str = "/chat/completions";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepseekSearchMode {
+    /// Official server-side search API: POST /v1/tools/search.
+    Tools,
+    /// Legacy chat-completion prompt search (kept for old configurations).
+    Chat,
+}
+
+/// DeepSeek search provider.
+///
+/// Defaults to the official server-side Search API
+/// (https://api.deepseek.com/v1/tools/search) which returns real URLs plus
+/// summary/content. A URL containing /chat/completions keeps the legacy
+/// prompt-based behaviour for backwards compatibility.
 pub struct DeepseekSearchProvider {
     client: reqwest::Client,
     api_key: String,
     endpoint: String,
     model: String,
+    count: usize,
+    mode: DeepseekSearchMode,
 }
 
 impl DeepseekSearchProvider {
@@ -226,16 +244,53 @@ impl DeepseekSearchProvider {
         api_key: String,
         endpoint: String,
         model: String,
+        count: usize,
         user_agent: &str,
         timeout_secs: u64,
     ) -> Result<DeepseekSearchProvider, SearchError> {
+        let (endpoint, mode) = normalize_deepseek_search_endpoint(&endpoint);
         Ok(DeepseekSearchProvider {
             client: build_client(user_agent, timeout_secs)?,
             api_key,
             endpoint,
             model,
+            count: count.clamp(1, 50),
+            mode,
         })
     }
+
+    pub fn mode(&self) -> &'static str {
+        match self.mode {
+            DeepseekSearchMode::Tools => "tools",
+            DeepseekSearchMode::Chat => "chat",
+        }
+    }
+}
+
+fn normalize_deepseek_search_endpoint(endpoint: &str) -> (String, DeepseekSearchMode) {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.contains(DEEPSEEK_CHAT_PATH) {
+        (trimmed.to_string(), DeepseekSearchMode::Chat)
+    } else if trimmed.ends_with(DEEPSEEK_TOOLS_SEARCH_PATH) {
+        (trimmed.to_string(), DeepseekSearchMode::Tools)
+    } else if trimmed.ends_with("/v1") {
+        (
+            format!("{trimmed}{DEEPSEEK_TOOLS_SEARCH_PATH}"),
+            DeepseekSearchMode::Tools,
+        )
+    } else {
+        (trimmed.to_string(), DeepseekSearchMode::Tools)
+    }
+}
+
+/// Body for the official POST /v1/tools/search API.
+pub fn deepseek_tools_search_body(query: &str, count: usize) -> Value {
+    json!({
+        "query": query,
+        "count": count.clamp(1, 50),
+        "need_content": true,
+        "ori_question": query
+    })
 }
 
 impl SearchProvider for DeepseekSearchProvider {
@@ -248,15 +303,18 @@ impl SearchProvider for DeepseekSearchProvider {
         query: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SearchResult>, SearchError>> {
         Box::pin(async move {
-            let body = json!({
-                "model": self.model,
-                "temperature": 0,
-                "max_tokens": 1200,
-                "messages": [
-                    {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
-                    {"role": "user", "content": query}
-                ]
-            });
+            let body = match self.mode {
+                DeepseekSearchMode::Tools => deepseek_tools_search_body(query, self.count),
+                DeepseekSearchMode::Chat => json!({
+                    "model": self.model,
+                    "temperature": 0,
+                    "max_tokens": 1200,
+                    "messages": [
+                        {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
+                        {"role": "user", "content": query}
+                    ]
+                }),
+            };
             let response = self
                 .client
                 .post(&self.endpoint)
@@ -269,9 +327,52 @@ impl SearchProvider for DeepseekSearchProvider {
                     SearchError::new(format!("deepseek-search: request failed: {error}"))
                 })?;
             let value = response_json(response, "deepseek-search").await?;
-            parse_deepseek_response(&value)
+            match self.mode {
+                DeepseekSearchMode::Tools => parse_deepseek_tools_response(&value),
+                DeepseekSearchMode::Chat => parse_deepseek_response(&value),
+            }
         })
     }
+}
+
+fn parse_deepseek_tools_response(value: &Value) -> Result<Vec<SearchResult>, SearchError> {
+    let items = value.get("results").and_then(Value::as_array).or_else(|| {
+        value
+            .get("data")
+            .and_then(|data| data.get("results"))
+            .and_then(Value::as_array)
+    });
+    let Some(items) = items else {
+        return Err(SearchError::new(
+            "deepseek-search: response has no results array",
+        ));
+    };
+    let mut results = Vec::new();
+    for item in items {
+        let url = item.get("url").and_then(Value::as_str).unwrap_or_default();
+        if !is_http_url(url) {
+            continue;
+        }
+        let summary = snippet_of(item, "summary");
+        let content = snippet_of(item, "content");
+        let snippet = if summary.is_empty() {
+            content
+        } else if content.is_empty() {
+            summary
+        } else {
+            collapse_ws(&truncate_chars(
+                &format!("{summary} {content}"),
+                SNIPPET_LIMIT,
+            ))
+        };
+        results.push(SearchResult {
+            title: snippet_of(item, "title"),
+            url: url.to_string(),
+            snippet,
+            provider: "deepseek".to_string(),
+        });
+    }
+    Ok(results)
 }
 
 fn parse_deepseek_response(value: &Value) -> Result<Vec<SearchResult>, SearchError> {
@@ -368,6 +469,61 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].provider, "tavily");
         assert!(results[0].snippet.contains("24:30"));
+    }
+
+    #[test]
+    fn parses_deepseek_official_tools_response() {
+        let value: Value = serde_json::from_str(
+            r#"{"results":[
+                {"title":"D","url":"https://d.example/s","summary":"毎週水曜 23:00","content":"放送情報 ..."},
+                {"title":"bad","url":"not-a-url","summary":"x","content":"y"}
+            ]}"#,
+        )
+        .unwrap();
+        let results = parse_deepseek_tools_response(&value).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://d.example/s");
+        assert_eq!(results[0].provider, "deepseek");
+        assert!(results[0].snippet.contains("23:00"));
+        assert!(results[0].snippet.contains("放送情報"));
+    }
+
+    #[test]
+    fn parses_deepseek_tools_response_wrapped_in_data() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":{"results":[{"title":"D","url":"https://d.example/s","summary":"毎週土曜 23:30","content":"text"}]}}"#,
+        )
+        .unwrap();
+        let results = parse_deepseek_tools_response(&value).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].snippet.contains("23:30"));
+    }
+
+    #[test]
+    fn deepseek_tools_body_has_expected_fields() {
+        let body = deepseek_tools_search_body("作品A 放送時間", 10);
+        assert_eq!(body["query"], "作品A 放送時間");
+        assert_eq!(body["count"], 10);
+        assert_eq!(body["need_content"], true);
+        assert_eq!(body["ori_question"], "作品A 放送時間");
+    }
+
+    #[test]
+    fn normalizes_deepseek_search_endpoints() {
+        let (endpoint, mode) = normalize_deepseek_search_endpoint("https://api.deepseek.com/v1/");
+        assert_eq!(endpoint, "https://api.deepseek.com/v1/tools/search");
+        assert_eq!(mode, DeepseekSearchMode::Tools);
+
+        let (endpoint, mode) =
+            normalize_deepseek_search_endpoint("https://api.deepseek.com/v1/tools/search");
+        assert_eq!(endpoint, "https://api.deepseek.com/v1/tools/search");
+        assert_eq!(mode, DeepseekSearchMode::Tools);
+
+        // Legacy configuration keeps the chat-completion pseudo search.
+        let (endpoint, mode) =
+            normalize_deepseek_search_endpoint("https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(endpoint, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(mode, DeepseekSearchMode::Chat);
     }
 
     #[test]

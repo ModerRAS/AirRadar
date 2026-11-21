@@ -1,19 +1,20 @@
 //! Rate-limited, bounded HTTP fetcher with disk cache and failure backoff.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER};
 use tokio::sync::Semaphore;
 
 use crate::cache::{Cache, CachedPage};
 use crate::config::Config;
 use crate::html;
 use crate::log;
-use crate::util::{domain_of, truncate_chars};
+use crate::model::{FetchFailureCategory, FetchFailureSample};
+use crate::util::{collapse_ws, domain_of, truncate_chars};
 
 pub const MAX_REDIRECTS: usize = 5;
 const FAILURES_BEFORE_BLOCK: u32 = 2;
@@ -29,6 +30,7 @@ pub enum FetchError {
     Timeout(String),
     Connect(String),
     Http(String),
+    Body(String),
     Status(u16),
     UnsupportedContentType(String),
     Blocked(String),
@@ -41,6 +43,7 @@ impl fmt::Display for FetchError {
             FetchError::Timeout(message) => write!(f, "timeout: {message}"),
             FetchError::Connect(message) => write!(f, "connect error: {message}"),
             FetchError::Http(message) => write!(f, "http error: {message}"),
+            FetchError::Body(message) => write!(f, "body read error: {message}"),
             FetchError::Status(status) => write!(f, "http status {status}"),
             FetchError::UnsupportedContentType(content_type) => {
                 write!(f, "unsupported content type: {content_type}")
@@ -55,7 +58,7 @@ impl std::error::Error for FetchError {}
 
 /// Failure bucket used in run statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FetchFailureCategory {
+enum FetchFailureBucket {
     Timeout,
     Http,
     Other,
@@ -73,27 +76,47 @@ impl FetchError {
         }
     }
 
-    /// Retry once on transient network errors, 5xx and 429.
+    /// Retry once for any transient-looking failure. Permanent HTTP client
+    /// errors (4xx except 429) and blocked domains are not retried; "other"
+    /// failures (empty page, unsupported content type, body read errors,
+    /// connect errors) get one retry as well so a flaky server can recover.
     pub fn is_retryable(&self) -> bool {
         match self {
-            FetchError::Timeout(_) | FetchError::Connect(_) | FetchError::Http(_) => true,
+            FetchError::Blocked(_) => false,
             FetchError::Status(status) => *status >= 500 || *status == 429,
-            FetchError::UnsupportedContentType(_)
-            | FetchError::Blocked(_)
-            | FetchError::Empty(_) => false,
+            _ => true,
         }
     }
 
-    fn failure_category(&self) -> FetchFailureCategory {
+    fn failure_category(&self) -> FetchFailureBucket {
         match self {
-            FetchError::Timeout(_) => FetchFailureCategory::Timeout,
-            FetchError::Status(_) => FetchFailureCategory::Http,
+            FetchError::Timeout(_) => FetchFailureBucket::Timeout,
+            FetchError::Status(_) => FetchFailureBucket::Http,
             FetchError::Connect(_)
             | FetchError::Http(_)
+            | FetchError::Body(_)
             | FetchError::UnsupportedContentType(_)
             | FetchError::Blocked(_)
-            | FetchError::Empty(_) => FetchFailureCategory::Other,
+            | FetchError::Empty(_) => FetchFailureBucket::Other,
         }
+    }
+
+    /// Fine-grained category used in fetch.topFailures diagnostics.
+    fn detail_kind(&self) -> &'static str {
+        match self {
+            FetchError::Timeout(_) => "timeout",
+            FetchError::Connect(_) => "connect",
+            FetchError::Http(_) => "http",
+            FetchError::Body(_) => "read_body",
+            FetchError::Status(_) => "http_status",
+            FetchError::UnsupportedContentType(_) => "unsupported_content_type",
+            FetchError::Blocked(_) => "blocked",
+            FetchError::Empty(_) => "empty",
+        }
+    }
+
+    fn from_reqwest_body(context: &str, error: reqwest::Error) -> FetchError {
+        FetchError::Body(format!("{context}: {error}"))
     }
 }
 
@@ -147,6 +170,19 @@ struct DomainState {
     blocked_until: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct FailureCategoryState {
+    count: usize,
+    example_domain: Option<String>,
+    example_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FailureDiagnostics {
+    categories: BTreeMap<String, FailureCategoryState>,
+    samples: Vec<FetchFailureSample>,
+}
+
 /// Bounded HTTP client used for schedule pages.
 pub struct Fetcher {
     client: reqwest::Client,
@@ -157,6 +193,7 @@ pub struct Fetcher {
     max_bytes: usize,
     domains: Mutex<HashMap<String, DomainState>>,
     stats: Mutex<FetchStats>,
+    diagnostics: Mutex<FailureDiagnostics>,
 }
 
 impl Fetcher {
@@ -166,6 +203,8 @@ impl Fetcher {
             .timeout(Duration::from_secs(cfg.fetch_timeout_secs))
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .gzip(true)
+            .brotli(true)
+            .deflate(true)
             .build()
             .map_err(|error| FetchError::Http(format!("build http client: {error}")))?;
         Ok(Fetcher {
@@ -177,6 +216,7 @@ impl Fetcher {
             max_bytes: cfg.fetch_max_bytes.max(1),
             domains: Mutex::new(HashMap::new()),
             stats: Mutex::new(FetchStats::default()),
+            diagnostics: Mutex::new(FailureDiagnostics::default()),
         })
     }
 
@@ -199,10 +239,90 @@ impl Fetcher {
     fn record_failure_category(&self, error: &FetchError) {
         let category = error.failure_category();
         self.update_stats(|stats| match category {
-            FetchFailureCategory::Timeout => stats.failures_timeout += 1,
-            FetchFailureCategory::Http => stats.failures_http += 1,
-            FetchFailureCategory::Other => stats.failures_other += 1,
+            FetchFailureBucket::Timeout => stats.failures_timeout += 1,
+            FetchFailureBucket::Http => stats.failures_http += 1,
+            FetchFailureBucket::Other => stats.failures_other += 1,
         });
+    }
+
+    /// Clear per-run failure diagnostics (called at the start of each run).
+    pub fn reset_failure_diagnostics(&self) {
+        *self
+            .diagnostics
+            .lock()
+            .expect("fetch diagnostics mutex poisoned") = FailureDiagnostics::default();
+    }
+
+    /// Detailed failure categories for the current run, sorted by count desc.
+    pub fn failure_categories(&self) -> Vec<FetchFailureCategory> {
+        let diagnostics = self
+            .diagnostics
+            .lock()
+            .expect("fetch diagnostics mutex poisoned");
+        let mut entries: Vec<(String, FailureCategoryState)> = diagnostics
+            .categories
+            .iter()
+            .map(|(category, state)| (category.clone(), state.clone()))
+            .collect();
+        entries.sort_by(|left, right| {
+            right
+                .1
+                .count
+                .cmp(&left.1.count)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        entries
+            .into_iter()
+            .take(8)
+            .map(|(category, state)| FetchFailureCategory {
+                category,
+                count: state.count,
+                example_domain: state.example_domain,
+                example_reason: state.example_reason,
+            })
+            .collect()
+    }
+
+    /// Up to five sampled failures (domain + sanitized reason) for diagnosis.
+    pub fn failure_samples(&self) -> Vec<FetchFailureSample> {
+        let diagnostics = self
+            .diagnostics
+            .lock()
+            .expect("fetch diagnostics mutex poisoned");
+        diagnostics.samples.iter().take(5).cloned().collect()
+    }
+
+    fn record_failure_details(&self, error: &FetchError, url: &str) {
+        let category = error.detail_kind().to_string();
+        let domain = domain_of(url);
+        let reason = sanitize_failure_reason(&error.to_string(), url, &domain);
+        let status = match error {
+            FetchError::Status(status) => Some(*status),
+            _ => None,
+        };
+        let mut diagnostics = self
+            .diagnostics
+            .lock()
+            .expect("fetch diagnostics mutex poisoned");
+        let entry = diagnostics.categories.entry(category.clone()).or_default();
+        entry.count += 1;
+        if entry.example_domain.is_none() {
+            entry.example_domain = Some(domain.clone());
+            entry.example_reason = Some(reason.clone());
+        }
+        if diagnostics.samples.len() < 20
+            && !diagnostics
+                .samples
+                .iter()
+                .any(|sample| sample.category == category && sample.domain == domain)
+        {
+            diagnostics.samples.push(FetchFailureSample {
+                domain,
+                category,
+                status,
+                reason,
+            });
+        }
     }
 
     /// Fetch a page as plain text, or serve it from the cache.
@@ -246,6 +366,7 @@ impl Fetcher {
                     }
                     self.update_stats(|stats| stats.failed += 1);
                     self.record_failure_category(&error);
+                    self.record_failure_details(&error, url);
                     match &error {
                         FetchError::Blocked(_) => {}
                         FetchError::Status(429) => self.block_domain(&domain, RATE_LIMIT_BLOCK),
@@ -258,6 +379,7 @@ impl Fetcher {
         let error = last_error.unwrap_or_else(|| FetchError::Http("fetch failed".to_string()));
         self.update_stats(|stats| stats.failed += 1);
         self.record_failure_category(&error);
+        self.record_failure_details(&error, url);
         self.record_failure(&domain);
         Err(error)
     }
@@ -271,15 +393,17 @@ impl Fetcher {
             .await
             .map_err(|_| FetchError::Http("fetch semaphore closed".to_string()))?;
         self.throttle().await;
-        let response = self
-            .client
-            .get(url)
-            .header(
-                ACCEPT,
-                "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
-            )
-            .send()
-            .await;
+        let mut request = self.client.get(url).header(
+            ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+        );
+        // Some official sites reject requests without a same-origin Referer or
+        // serve English/JS shells unless a Japanese Accept-Language is present.
+        request = request.header(ACCEPT_LANGUAGE, "ja,en-US;q=0.8,en;q=0.6,zh-CN;q=0.5");
+        if let Some(origin) = request_origin(url) {
+            request = request.header(REFERER, origin);
+        }
+        let response = request.send().await;
         drop(permit);
         let mut response = match response {
             Ok(response) => response,
@@ -319,7 +443,7 @@ impl Fetcher {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    return Err(FetchError::from_reqwest(
+                    return Err(FetchError::from_reqwest_body(
                         &format!("{url}: read body"),
                         error,
                     ))
@@ -419,6 +543,23 @@ impl Fetcher {
         let mut domains = self.domains.lock().expect("domain mutex poisoned");
         domains.remove(domain);
     }
+}
+
+/// Scheme + host + trailing slash for the Referer header.
+fn request_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("{scheme}://{host}/"))
+    }
+}
+
+/// Strip the full request URL from a failure reason and collapse whitespace.
+fn sanitize_failure_reason(message: &str, url: &str, domain: &str) -> String {
+    let replaced = message.replace(url, domain);
+    truncate_chars(&collapse_ws(&replaced), 160).to_string()
 }
 
 /// Content types accepted for schedule extraction.
@@ -598,20 +739,32 @@ mod tests {
         assert!(FetchError::Status(503).is_retryable());
         assert!(FetchError::Status(429).is_retryable());
         assert!(!FetchError::Status(404).is_retryable());
-        assert!(!FetchError::Empty("e".to_string()).is_retryable());
+        // "other" failures get one retry too, except blocked domains.
+        assert!(FetchError::Empty("e".to_string()).is_retryable());
+        assert!(FetchError::UnsupportedContentType("image/png".to_string()).is_retryable());
+        assert!(FetchError::Body("b".to_string()).is_retryable());
         assert!(!FetchError::Blocked("example.com".to_string()).is_retryable());
 
         assert_eq!(
             FetchError::Timeout("t".to_string()).failure_category(),
-            FetchFailureCategory::Timeout
+            FetchFailureBucket::Timeout
         );
         assert_eq!(
             FetchError::Status(503).failure_category(),
-            FetchFailureCategory::Http
+            FetchFailureBucket::Http
         );
         assert_eq!(
             FetchError::Empty("e".to_string()).failure_category(),
-            FetchFailureCategory::Other
+            FetchFailureBucket::Other
+        );
+        assert_eq!(
+            FetchError::Body("b".to_string()).failure_category(),
+            FetchFailureBucket::Other
+        );
+        assert_eq!(FetchError::Body("b".to_string()).detail_kind(), "read_body");
+        assert_eq!(
+            FetchError::UnsupportedContentType("image/png".to_string()).detail_kind(),
+            "unsupported_content_type"
         );
 
         let before = FetchStats {
@@ -634,6 +787,65 @@ mod tests {
         assert_eq!(delta.failed, 1);
         assert_eq!(delta.failures_http, 1);
         assert_eq!(delta.failures_timeout, 0);
+    }
+
+    #[test]
+    fn failure_diagnostics_are_sanitized_and_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = test_fetcher(&dir);
+        fetcher.record_failure_details(
+            &FetchError::UnsupportedContentType("image/png".to_string()),
+            "https://Example.COM/path/secret?token=abc",
+        );
+        fetcher.record_failure_details(&FetchError::Status(403), "https://blocked.example/page");
+
+        let categories = fetcher.failure_categories();
+        assert!(categories.iter().any(|category| {
+            category.category == "unsupported_content_type" && category.count == 1
+        }));
+        assert!(categories
+            .iter()
+            .any(|category| category.category == "http_status" && category.count == 1));
+
+        let samples = fetcher.failure_samples();
+        assert_eq!(samples.len(), 2);
+        let unsupported = samples
+            .iter()
+            .find(|sample| sample.category == "unsupported_content_type")
+            .expect("unsupported sample");
+        assert_eq!(unsupported.domain, "example.com");
+        assert!(unsupported.reason.contains("image/png"));
+        assert!(!unsupported.reason.contains("token"));
+        assert!(!unsupported.reason.contains('?'));
+        assert!(samples.iter().any(|sample| sample.status == Some(403)));
+
+        fetcher.reset_failure_diagnostics();
+        assert!(fetcher.failure_categories().is_empty());
+        assert!(fetcher.failure_samples().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sends_referer_and_accept_language() {
+        let (address, server) = spawn_http_server(vec![(
+            200,
+            "<html><body><p>毎週土曜 23:30 放送</p></body></html>",
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = test_fetcher(&dir);
+        fetcher
+            .get_text(&format!("http://{address}/schedule"))
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+        let request = requests[0].to_ascii_lowercase();
+        assert!(
+            request.contains("accept-language: ja"),
+            "request: {request}"
+        );
+        assert!(
+            request.contains(&format!("referer: http://{address}/")),
+            "request: {request}"
+        );
     }
 
     fn spawn_http_server(

@@ -85,19 +85,22 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platforms to include (`ALL` = no filter) |
 | `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search backends in fallback order; only providers with a key are enabled |
 | `SEARCH_QUERIES_PER_SUBJECT` | `2` | Search queries issued per subject |
-| `MAX_SEARCH_CALLS` | `240` | Search-query budget per run |
+| `MAX_SEARCH_CALLS` | `400` | Search-query budget per run |
 | `SEARCH_FALLBACK_ON_EMPTY` | `false` | Also try the next provider when a provider returns zero results |
 | `SEARCH_TIMEOUT_SECS` | `20` | Per search request timeout |
 | `BRAVE_API_KEY` / `_FILE` | unset | Brave Search API key |
 | `TAVILY_API_KEY` / `_FILE` | unset | Tavily Search API key |
 | `DEEPSEEK_API_KEY` / `_FILE` | unset | DeepSeek **search** key (independent from the OpenCode Go LLM key) |
-| `DEEPSEEK_SEARCH_URL` | `https://api.deepseek.com/v1/chat/completions` | DeepSeek search endpoint |
-| `DEEPSEEK_SEARCH_MODEL` | `deepseek-chat` | DeepSeek search model |
+| `DEEPSEEK_SEARCH_URL` | `https://api.deepseek.com/v1/tools/search` | Official DeepSeek server-side Search API (`/chat/completions` keeps the legacy prompt search) |
+| `DEEPSEEK_SEARCH_COUNT` | `10` | Results per DeepSeek search query (1-50) |
+| `DEEPSEEK_FETCH_URL` | `https://api.deepseek.com/v1/tools/fetch` | Official DeepSeek server-side Fetch API used as a local-fetch fallback |
+| `MAX_DEEPSEEK_FETCH_CALLS` | `150` | Per-run budget for server-side fetch fallback calls |
+| `DEEPSEEK_SEARCH_MODEL` | `deepseek-chat` | Only for legacy `/chat/completions` prompt search |
 | `LLM_BASE_URL` | unset | OpenAI-compatible extraction fallback base URL |
 | `LLM_API_KEY` / `_FILE` | unset | Extraction fallback key (OpenCode Go subscription key; independent from search keys) |
 | `LLM_MODEL` | unset | Extraction fallback model (all three of LLM_BASE_URL/LLM_API_KEY/LLM_MODEL must be set) |
 | `LLM_SESSION_ID` | empty | OpenCode Go session id; when empty a stable id is generated and persisted in `DATA_DIR/llm-session-id` |
-| `LLM_BATCH_SIZE` | `5` | Subjects per LLM request |
+| `LLM_BATCH_SIZE` | `8` | Subjects per LLM request |
 | `MAX_LLM_CALLS` | `40` | LLM request budget per run |
 | `LLM_MAX_INPUT_CHARS` | `1200` | Text sent per subject to the LLM |
 | `FETCH_TIMEOUT_SECS` | `15` | Page fetch timeout |
@@ -111,6 +114,7 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `HISTORY_KEEP` | `10` | Published history versions kept on disk |
 | `STATE_RETENTION_SEASONS` | `4` | Seasons retained in `state.json` |
 | `PUBLISH_MEDIUM` | `true` | `false` publishes only high-confidence rows and sends medium to review |
+| `PUBLISH_WEEKDAY_ONLY` | `true` | Publish weekday-only rows (`time: null`, `timeKnown: false`, confidence `unknown`) for subjects without a verified time |
 | `MAX_CANDIDATES_PER_SUBJECT` | `40` | Cap on stored candidate observations |
 
 ### Credentials: search vs LLM (independent)
@@ -119,17 +123,19 @@ AirRadar uses two independent credential sets and never mixes them:
 
 | Purpose | Variables |
 | --- | --- |
-| Web search / discovery (snippets, URLs, pages) | `SEARCH_PROVIDER_ORDER`, `DEEPSEEK_API_KEY` (+ optional `DEEPSEEK_SEARCH_URL`/`DEEPSEEK_SEARCH_MODEL`), `BRAVE_API_KEY`, `TAVILY_API_KEY` |
+| Web search / discovery (snippets, URLs, pages) | `SEARCH_PROVIDER_ORDER`, `DEEPSEEK_API_KEY` (+ `DEEPSEEK_SEARCH_URL`, `DEEPSEEK_SEARCH_COUNT`, and the server-side fetch fallback `DEEPSEEK_FETCH_URL`/`MAX_DEEPSEEK_FETCH_CALLS`), `BRAVE_API_KEY`, `TAVILY_API_KEY` |
 | LLM extraction fallback (rules failed) | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_SESSION_ID` |
 
-Example setup with DeepSeek search + OpenCode Go LLM:
+Example setup with DeepSeek search + server-side fetch + OpenCode Go LLM:
 
 ```bash
-# search: its own DeepSeek key
+# search: its own DeepSeek key; official server-side Search/Fetch APIs
 SEARCH_PROVIDER_ORDER=deepseek
-DEEPSEEK_API_KEY=<DeepSeek search key>
-DEEPSEEK_SEARCH_URL=https://api.deepseek.com/v1/chat/completions
-DEEPSEEK_SEARCH_MODEL=deepseek-chat
+DEEPSEEK_API_KEY=<DeepSeek API key>
+DEEPSEEK_SEARCH_URL=https://api.deepseek.com/v1/tools/search
+DEEPSEEK_SEARCH_COUNT=10
+DEEPSEEK_FETCH_URL=https://api.deepseek.com/v1/tools/fetch
+MAX_DEEPSEEK_FETCH_CALLS=150
 
 # LLM fallback: OpenCode Go subscription (never the DeepSeek search key)
 LLM_BASE_URL=https://opencode.ai/inference/go/v1
@@ -140,6 +146,20 @@ LLM_SESSION_ID=                     # optional; auto-generated when empty
 
 The search router only reads the search keys; the LLM client only reads
 `LLM_*`. Setting one group never enables the other.
+
+### DeepSeek official Search / Fetch APIs
+
+DeepSeek search uses the official server-side API by default:
+
+- `POST https://api.deepseek.com/v1/tools/search` with `{query, count, need_content, ori_question}`;
+  results provide real `title`/`url` plus `summary`/`content`, which are used as evidence.
+- `POST https://api.deepseek.com/v1/tools/fetch` with `{url}` fetches a page server-side
+  (title + Markdown text). AirRadar only calls it when a local page fetch failed
+  (anti-bot/TLS/region/empty JS shell), bounded by `MAX_DEEPSEEK_FETCH_CALLS`
+  (default 150/run) with 5 QPS-friendly throttling and 429 cooldown.
+- Both endpoints share `DEEPSEEK_API_KEY`; neither uses `LLM_API_KEY`.
+- A URL containing `/chat/completions` keeps the legacy prompt-based search for
+  backwards compatibility; the default is the official tools API.
 
 ### OpenCode Go (LLM extraction fallback)
 
@@ -202,6 +222,7 @@ served verbatim by the API. Field names are camelCase:
       "airDate": "2026-10-07",
       "weekday": 3,
       "time": "23:00",
+      "timeKnown": true,
       "timezone": "Asia/Tokyo",
       "confidence": "high",
       "sources": [
@@ -214,26 +235,37 @@ served verbatim by the API. Field names are camelCase:
 ```
 
 `weekday` is the **actual JST calendar day** (`1` = Monday ... `7` = Sunday) and
-`time` is `HH:MM` JST. Late-night Japanese notation is normalised to the real
-clock time: `土曜 25:15` and `土曜 深夜1:15` both become **Sunday 01:15**.
+`time` is `HH:MM` JST when known. Late-night Japanese notation is normalised to
+the real clock time: `土曜 25:15` and `土曜 深夜1:15` both become **Sunday 01:15**.
 Clients convert JST to the user's local time zone.
+
+Weekday-only rows (Bangumi has a weekday but no verified clock time) are
+published with `"time": null`, `"timeKnown": false` and
+`"confidence": "unknown"` when `PUBLISH_WEEKDAY_ONLY=true` (default). The
+`timeKnown` field defaults to `true` when missing, so older payloads stay
+compatible; clients should render such rows as "time unknown" under the
+weekday.
 
 ## Data quality & confidence
 
 1. **Discovery**: Bangumi `POST /v0/search/subjects` (empty keyword + `air_date`
    range + `type=2`), falling back to `GET /calendar`. Only
    `id/name/name_cn/air_date/images/platform/infobox` are used.
-2. **Evidence**: search result titles + snippets (extracted independently of
-   page fetches, so a failed fetch can still yield a time), fetched pages (rules
-   first) and the subject's official website. Transient HTTP failures
-   (timeout/5xx/429) get one retry; failure categories are reported in
-   `/api/status`. The optional LLM fallback only runs for subjects that the
-   rules could not resolve.
+2. **Evidence**: DeepSeek official search results (real URLs + summary/content),
+   search result titles + snippets (extracted independently of page fetches, so
+   a failed fetch can still yield a time), locally fetched pages, the subject's
+   official website, and — when a local fetch fails — the DeepSeek server-side
+   fetch fallback. Transient HTTP failures get one retry; failure categories and
+   sampled domains are reported in `/api/status.lastRun.fetch`. The optional LLM
+   fallback only runs for subjects that the rules could not resolve.
 3. **Independence = source domain**. A snippet and a page from the same domain
    count once; `llm` counts as one source.
 4. **Confidence**: two or more independent domains agreeing -> `high`; exactly
-   one -> `medium`; disagreements or missing times -> excluded from the schedule
-   and written to `/data/review.json` + `/data/review.md` (human readable).
+   one -> `medium`; conflicts -> excluded from the schedule and written to
+   `/data/review.json` + `/data/review.md` (human readable). Subjects with no
+   verified time are published as weekday-only rows with confidence `unknown`
+   when `PUBLISH_WEEKDAY_ONLY=true` (default), so the whole season is listed;
+   set it to `false` to keep them in the review queue instead.
    Set `PUBLISH_MEDIUM=false` to hold medium-confidence rows for review too.
 5. **Coverage**: the Bangumi search is paginated until the full broadcast
    window is collected (the API returns ~20 items per page; earlier versions
@@ -274,8 +306,10 @@ The repository ships:
   `ghcr.io/moderras/airradar` (`latest` + `sha-<commit>`).
 - `.github/workflows/deploy.yml` — build -> push GHCR -> SSH to the VPS ->
   create/rotate docker secrets -> `docker stack deploy --with-registry-auth`.
-  It also passes `LLM_SESSION_ID` and `DEEPSEEK_SEARCH_URL`/`DEEPSEEK_SEARCH_MODEL`
-  through when configured (search and LLM credentials stay independent).
+  It also passes `LLM_SESSION_ID`, `LLM_BATCH_SIZE`, `PUBLISH_WEEKDAY_ONLY` and the
+  DeepSeek tools settings (`DEEPSEEK_SEARCH_URL`, `DEEPSEEK_SEARCH_COUNT`,
+  `DEEPSEEK_FETCH_URL`, `MAX_DEEPSEEK_FETCH_CALLS`) when configured (search and
+  LLM credentials stay independent).
 
 Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 
@@ -309,10 +343,14 @@ Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 | `BANGUMI_UA` | AirRadar default UA | Bangumi User-Agent |
 | `REFRESH_HOURS` | `6` | Collection interval |
 | `MAX_SUBJECTS_PER_RUN` | `120` | Processing window (full season in one run) |
-| `MAX_SEARCH_CALLS` / `MAX_LLM_CALLS` | `240` / `40` | Per-run API budgets |
+| `MAX_SEARCH_CALLS` / `MAX_LLM_CALLS` | `400` / `40` | Per-run API budgets |
 | `SEASON_PADDING_DAYS` | `10` | Broadcast window padding before the calendar season |
+| `PUBLISH_WEEKDAY_ONLY` | `true` | Publish weekday-only (time unknown) rows |
+| `LLM_BATCH_SIZE` | `8` | Subjects per LLM request |
 | `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search fallback order (for DeepSeek-only search use `deepseek`) |
-| `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_MODEL` | DeepSeek defaults | DeepSeek search endpoint/model |
+| `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_COUNT` | official tools defaults | DeepSeek server-side search endpoint and result count |
+| `DEEPSEEK_FETCH_URL` / `MAX_DEEPSEEK_FETCH_CALLS` | official tools defaults / `150` | DeepSeek server-side fetch fallback endpoint and per-run budget |
+| `DEEPSEEK_SEARCH_MODEL` | `deepseek-chat` | Only for legacy `/chat/completions` search |
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platform filter |
 | `SEASON_OVERRIDE` | empty | Force a season |
 | `LLM_BASE_URL` / `LLM_MODEL` | empty | LLM fallback endpoint/model, e.g. OpenCode Go base (key stays a secret) |

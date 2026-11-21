@@ -119,6 +119,12 @@ pub struct Config {
     pub deepseek_api_key: Option<String>,
     pub deepseek_search_url: String,
     pub deepseek_search_model: String,
+    /// Number of results per DeepSeek official search query (1-50).
+    pub deepseek_search_count: usize,
+    /// DeepSeek official server-side page fetch endpoint.
+    pub deepseek_fetch_url: String,
+    /// Per-run budget for DeepSeek server-side page fetches.
+    pub max_deepseek_fetch_calls: usize,
     pub llm_base_url: Option<String>,
     pub llm_api_key: Option<String>,
     pub llm_model: Option<String>,
@@ -149,6 +155,10 @@ pub struct Config {
     pub history_keep: usize,
     pub state_retention_seasons: usize,
     pub publish_medium: bool,
+    /// Publish weekday-only rows (time null, confidence unknown) so every
+    /// season subject is listed for clients even when the clock time is
+    /// unverified.
+    pub publish_weekday_only: bool,
     pub max_candidates_per_subject: usize,
 }
 
@@ -240,7 +250,7 @@ impl Config {
         let fetch_concurrency = clamp(parse_or(&map, "FETCH_CONCURRENCY", 4usize)?, 1, 8);
         let history_keep = clamp(parse_or(&map, "HISTORY_KEEP", 10usize)?, 1, 10);
         let max_llm_calls = clamp(parse_or(&map, "MAX_LLM_CALLS", 40usize)?, 0, 100);
-        let max_search_calls = clamp(parse_or(&map, "MAX_SEARCH_CALLS", 240usize)?, 0, 2000);
+        let max_search_calls = clamp(parse_or(&map, "MAX_SEARCH_CALLS", 400usize)?, 0, 2000);
         let search_queries_per_subject =
             clamp(parse_or(&map, "SEARCH_QUERIES_PER_SUBJECT", 2usize)?, 1, 5);
         let fetch_pages_per_subject =
@@ -260,7 +270,7 @@ impl Config {
         );
         let state_retention_seasons =
             clamp(parse_or(&map, "STATE_RETENTION_SEASONS", 4usize)?, 1, 12);
-        let llm_batch_size = clamp(parse_or(&map, "LLM_BATCH_SIZE", 5usize)?, 1, 20);
+        let llm_batch_size = clamp(parse_or(&map, "LLM_BATCH_SIZE", 8usize)?, 1, 20);
         let llm_max_input_chars =
             clamp(parse_or(&map, "LLM_MAX_INPUT_CHARS", 1200usize)?, 200, 8000);
         let max_candidates_per_subject = clamp(
@@ -274,6 +284,14 @@ impl Config {
         let llm_api_key = secret(&map, "LLM_API_KEY")?;
         let llm_model = text(&map, "LLM_MODEL");
         let llm_session_id = text(&map, "LLM_SESSION_ID");
+        let deepseek_search_count = clamp(parse_or(&map, "DEEPSEEK_SEARCH_COUNT", 10usize)?, 1, 50);
+        let deepseek_fetch_url = text(&map, "DEEPSEEK_FETCH_URL")
+            .unwrap_or_else(|| "https://api.deepseek.com/v1/tools/fetch".to_string());
+        let max_deepseek_fetch_calls = clamp(
+            parse_or(&map, "MAX_DEEPSEEK_FETCH_CALLS", 150usize)?,
+            0,
+            1000,
+        );
 
         Ok(Config {
             port: parse_or(&map, "PORT", 8080u16)?,
@@ -290,9 +308,12 @@ impl Config {
             tavily_api_key: secret(&map, "TAVILY_API_KEY")?,
             deepseek_api_key: secret(&map, "DEEPSEEK_API_KEY")?,
             deepseek_search_url: text(&map, "DEEPSEEK_SEARCH_URL")
-                .unwrap_or_else(|| "https://api.deepseek.com/v1/chat/completions".to_string()),
+                .unwrap_or_else(|| "https://api.deepseek.com/v1/tools/search".to_string()),
             deepseek_search_model: text(&map, "DEEPSEEK_SEARCH_MODEL")
                 .unwrap_or_else(|| "deepseek-chat".to_string()),
+            deepseek_search_count,
+            deepseek_fetch_url,
+            max_deepseek_fetch_calls,
             llm_base_url,
             llm_api_key,
             llm_model,
@@ -318,6 +339,7 @@ impl Config {
             history_keep,
             state_retention_seasons,
             publish_medium: parse_bool_or(&map, "PUBLISH_MEDIUM", true)?,
+            publish_weekday_only: parse_bool_or(&map, "PUBLISH_WEEKDAY_ONLY", true)?,
             max_candidates_per_subject,
         })
     }
@@ -338,8 +360,11 @@ impl Config {
             brave_api_key: None,
             tavily_api_key: None,
             deepseek_api_key: None,
-            deepseek_search_url: "https://api.deepseek.com/v1/chat/completions".to_string(),
+            deepseek_search_url: "https://api.deepseek.com/v1/tools/search".to_string(),
             deepseek_search_model: "deepseek-chat".to_string(),
+            deepseek_search_count: 10,
+            deepseek_fetch_url: "https://api.deepseek.com/v1/tools/fetch".to_string(),
+            max_deepseek_fetch_calls: 0,
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,
@@ -365,6 +390,7 @@ impl Config {
             history_keep: 3,
             state_retention_seasons: 4,
             publish_medium: true,
+            publish_weekday_only: true,
             max_candidates_per_subject: 40,
         }
     }
@@ -399,8 +425,17 @@ mod tests {
         assert_eq!(config.port, 8080);
         assert_eq!(config.refresh_hours, 6.0);
         assert_eq!(config.max_subjects_per_run, 120);
-        assert_eq!(config.max_search_calls, 240);
+        assert_eq!(config.max_search_calls, 400);
         assert_eq!(config.max_llm_calls, 40);
+        assert_eq!(config.search_queries_per_subject, 2);
+        assert_eq!(config.deepseek_search_count, 10);
+        assert_eq!(
+            config.deepseek_search_url,
+            "https://api.deepseek.com/v1/tools/search"
+        );
+        assert_eq!(config.max_deepseek_fetch_calls, 150);
+        assert_eq!(config.llm_batch_size, 8);
+        assert!(config.publish_weekday_only);
         assert_eq!(config.season_padding_days, 10);
         assert_eq!(config.history_keep, 10);
         assert_eq!(config.cache_dir, PathBuf::from("./data").join("cache"));
@@ -460,6 +495,14 @@ mod tests {
         assert!(error.message.contains("SEASON_OVERRIDE"));
         let error = Config::from_pairs(&pairs(&[("PUBLISH_MEDIUM", "maybe")])).unwrap_err();
         assert!(error.message.contains("PUBLISH_MEDIUM"));
+    }
+
+    #[test]
+    fn publish_weekday_only_is_configurable() {
+        let config = Config::from_pairs(&[]).unwrap();
+        assert!(config.publish_weekday_only);
+        let config = Config::from_pairs(&pairs(&[("PUBLISH_WEEKDAY_ONLY", "false")])).unwrap();
+        assert!(!config.publish_weekday_only);
     }
 
     #[test]

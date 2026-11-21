@@ -132,6 +132,10 @@ pub struct SubjectState {
     pub candidates: Vec<TimeCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<ResolvedSlot>,
+    /// Weekday-only fallback used when no verified time exists (published with
+    /// confidence unknown if PUBLISH_WEEKDAY_ONLY is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekday_only: Option<u8>,
     #[serde(default)]
     pub confidence: Confidence,
     #[serde(default)]
@@ -148,7 +152,8 @@ pub struct SubjectState {
 
 impl SubjectState {
     pub fn is_published(&self) -> bool {
-        self.status == ReviewStatus::Published && self.resolved.is_some()
+        self.status == ReviewStatus::Published
+            && (self.resolved.is_some() || self.weekday_only.is_some())
     }
 }
 
@@ -194,12 +199,21 @@ pub struct ScheduleItem {
     pub image: Option<String>,
     /// ISO weekday of the actual JST calendar day (1=Mon..7=Sun).
     pub weekday: u8,
-    /// HH:MM JST, 24h clock.
-    pub time: String,
+    /// HH:MM JST, 24h clock; null when only the weekday is known.
+    #[serde(default)]
+    pub time: Option<String>,
+    /// False for weekday-only rows (published with confidence unknown).
+    /// Missing in old payloads means true.
+    #[serde(default = "default_true")]
+    pub time_known: bool,
     pub timezone: String,
     pub confidence: Confidence,
     pub sources: Vec<ScheduleSource>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Published schedule document (GET /api/schedule/latest and /data/schedule/<season>.json).
@@ -290,6 +304,48 @@ pub struct LlmStat {
     pub last_error: Option<String>,
 }
 
+/// One sampled fetch failure (domain only, never a full URL with a path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchFailureSample {
+    pub domain: String,
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub reason: String,
+}
+
+/// Aggregated fetch failure count per detailed category.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchFailureCategory {
+    pub category: String,
+    pub count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_reason: Option<String>,
+}
+
+/// DeepSeek official server-side page fetch fallback counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepseekFetchStat {
+    pub configured: bool,
+    #[serde(default)]
+    pub calls: usize,
+    #[serde(default)]
+    pub successes: usize,
+    #[serde(default)]
+    pub failures: usize,
+    #[serde(default)]
+    pub rate_limited: usize,
+    #[serde(default)]
+    pub budget_exhausted: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 /// HTTP fetch statistics for the last run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -307,6 +363,12 @@ pub struct FetchStat {
     pub failures_http: usize,
     #[serde(default)]
     pub failures_other: usize,
+    /// Detailed top failure categories for diagnosis (sorted by count desc).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_categories: Vec<FetchFailureCategory>,
+    /// Up to five sampled failures (domain + reason) for diagnosis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_failures: Vec<FetchFailureSample>,
 }
 
 /// Result of one collection run (persisted in /data/status.json).
@@ -324,6 +386,9 @@ pub struct RunSummary {
     pub subjects_fetched: usize,
     pub subjects_processed: usize,
     pub items_published: usize,
+    /// Published rows that only have a weekday (time unknown).
+    #[serde(default)]
+    pub weekday_only_count: usize,
     pub high_confidence: usize,
     pub medium_confidence: usize,
     pub review_count: usize,
@@ -331,6 +396,8 @@ pub struct RunSummary {
     pub search: Vec<ProviderStat>,
     pub llm: LlmStat,
     pub fetch: FetchStat,
+    #[serde(default)]
+    pub deepseek_fetch: DeepseekFetchStat,
     #[serde(default)]
     pub errors: Vec<String>,
 }

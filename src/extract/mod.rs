@@ -495,6 +495,17 @@ fn line_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
     (line_start, line_end)
 }
 
+/// True when any title variant occurs anywhere in the text (normalised,
+/// case-insensitive). Used as a lenient context signal for search snippets.
+pub fn text_mentions_title(text: &str, names: &[String]) -> bool {
+    let normalized_text = normalize_name(text);
+    title_variants(names)
+        .iter()
+        .map(|name| normalize_name(name))
+        .filter(|name| name.chars().count() >= 2)
+        .any(|name| normalized_text.contains(name.as_str()))
+}
+
 /// Extract slots and keep only those attributable to the subject.
 ///
 /// On table rows (converted to one line per row by the HTML extractor) the
@@ -677,6 +688,15 @@ mod tests {
         let slots = extract_slots("毎週金曜日 放送");
         assert_eq!(times(&slots), vec![(5, None)]);
         assert_eq!(slots[0].method, "jp:weekday-only");
+    }
+
+    #[test]
+    fn title_mentions_title_anywhere() {
+        let text = format!("作品A {} 毎週土曜 23:30", "x".repeat(400));
+        assert!(text_mentions_title(&text, &["作品A".to_string()]));
+        assert!(!text_mentions_title(&text, &["作品B".to_string()]));
+        // Short/empty titles never match.
+        assert!(!text_mentions_title(&text, &["A".to_string()]));
     }
 
     #[test]
