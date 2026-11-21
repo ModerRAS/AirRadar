@@ -11,6 +11,7 @@ pub mod atomic;
 pub mod bangumi;
 pub mod cache;
 pub mod config;
+pub mod deepseek_fetch;
 pub mod extract;
 pub mod fetch;
 pub mod html;

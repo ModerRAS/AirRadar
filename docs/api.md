@@ -79,6 +79,7 @@ curl -fsS https://schedule.example.com/api/schedule/latest
       "image": "https://lain.bgm.tv/pic/cover/l/65/61/393010_EIOi9.jpg",
       "weekday": 3,
       "time": "23:00",
+      "timeKnown": true,
       "timezone": "Asia/Tokyo",
       "confidence": "high",
       "sources": [
@@ -153,11 +154,12 @@ curl -fsS https://schedule.example.com/api/status
     "subjectListSource": "bangumi-search",
     "subjectsFetched": 172,
     "subjectsProcessed": 120,
-    "itemsPublished": 48,
-    "highConfidence": 31,
+    "itemsPublished": 96,
+    "weekdayOnlyCount": 51,
+    "highConfidence": 28,
     "mediumConfidence": 17,
-    "reviewCount": 40,
-    "unknownCount": 72,
+    "reviewCount": 3,
+    "unknownCount": 0,
     "search": [
       {
         "provider": "brave",
@@ -177,7 +179,22 @@ curl -fsS https://schedule.example.com/api/status
       "retried": 118,
       "failuresTimeout": 27,
       "failuresHttp": 91,
-      "failuresOther": 4
+      "failuresOther": 4,
+      "failureCategories": [
+        {"category": "http_status", "count": 91, "exampleDomain": "example.jp", "exampleReason": "http status 403"},
+        {"category": "unsupported_content_type", "count": 4, "exampleDomain": "example.com", "exampleReason": "unsupported content type: image/png"}
+      ],
+      "topFailures": [
+        {"domain": "example.jp", "category": "http_status", "status": 403, "reason": "http status 403"}
+      ]
+    },
+    "deepseekFetch": {
+      "configured": true,
+      "calls": 68,
+      "successes": 61,
+      "failures": 7,
+      "rateLimited": 1,
+      "budgetExhausted": 0
     },
     "errors": []
   },
@@ -204,9 +221,14 @@ Notes:
   is `null` for a second after a restart until the scheduler loop runs.
 - `search.providers` lists only providers that have a key configured;
   `search.configuredOrder` is the configured fallback order.
-- `lastRun.fetch` counts page fetches: `retried` is the number of extra
-  attempts made by the one-shot transient retry, and
-  `failuresTimeout`/`failuresHttp`/`failuresOther` classify failures.
+- `lastRun.fetch` counts local page fetches: `retried` is the number of extra
+  attempts made by the one-shot transient retry; `failuresTimeout`/`failuresHttp`/
+  `failuresOther` classify failures; `failureCategories` aggregates detailed
+  categories; `topFailures` samples up to five failures as **domain + reason**
+  (never a full URL with a path/query).
+- `lastRun.deepseekFetch` reports the server-side DeepSeek Tools Fetch fallback:
+  `calls`, `successes`, `failures`, `rateLimited` (HTTP 429/cooldown) and
+  `budgetExhausted` (per-run `MAX_DEEPSEEK_FETCH_CALLS`).
 - `subjectsFetched` is the number of Bangumi subjects that survived the
   `INCLUDE_PLATFORMS` filter (the platform-eligible set), and
   `subjectsProcessed` is the selected window. With the default

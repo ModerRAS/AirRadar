@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -21,14 +21,15 @@ use crate::app::{BoxFuture, RefreshController, RefreshRequest, TriggerAccepted, 
 use crate::bangumi::BangumiClient;
 use crate::cache::Cache;
 use crate::config::Config;
+use crate::deepseek_fetch::{DeepseekFetchClient, DeepseekFetchPage};
 use crate::extract::{self, RawSlot};
 use crate::fetch::{FetchStats, Fetcher};
 use crate::llm::{LlmClient, LlmRequest, LlmRunStats, LlmSuggestion};
 use crate::log;
 use crate::model::{
-    Confidence, FetchStat, LlmStat, ProviderStat, ReviewEntry, ReviewFile, ReviewStatus,
-    RunSummary, RunTrigger, ScheduleFile, ScheduleItem, ScheduleSource, StateFile, StatusFile,
-    SubjectState, TimeCandidate, SCHEDULE_TIMEZONE, SCHEMA_VERSION,
+    Confidence, DeepseekFetchStat, FetchStat, LlmStat, ProviderStat, ReviewEntry, ReviewFile,
+    ReviewStatus, RunSummary, RunTrigger, ScheduleFile, ScheduleItem, ScheduleSource, StateFile,
+    StatusFile, SubjectState, TimeCandidate, SCHEDULE_TIMEZONE, SCHEMA_VERSION,
 };
 use crate::search::{SearchAttempt, SearchResult, SearchRouter};
 use crate::season::SeasonRef;
@@ -73,6 +74,16 @@ fn try_take(counter: &AtomicUsize) -> bool {
             Err(actual) => current = actual,
         }
     }
+}
+
+/// Weekday for the fallback row: Bangumi infobox 放送星期 first, then the
+/// weekday of the first air date.
+fn weekday_fallback(subject: &crate::bangumi::BangumiSubject) -> Option<u8> {
+    subject.weekday_hint.or_else(|| {
+        subject
+            .air_date
+            .map(|date| date.weekday().number_from_monday() as u8)
+    })
 }
 
 fn subject_names(subject: &crate::bangumi::BangumiSubject) -> Vec<String> {
@@ -177,6 +188,8 @@ struct SubjectOutcome {
     verification: Verification,
     search_attempts: Vec<SearchAttempt>,
     llm_text: String,
+    /// Weekday-only fallback set after the LLM pass (time still unknown).
+    weekday_only: Option<u8>,
 }
 
 /// Collection pipeline. Build once at process start.
@@ -188,6 +201,7 @@ pub struct Pipeline {
     search: Arc<SearchRouter>,
     llm: Option<Arc<LlmClient>>,
     bangumi: Arc<BangumiClient>,
+    deepseek_fetch: Option<Arc<DeepseekFetchClient>>,
 }
 
 impl Pipeline {
@@ -218,6 +232,9 @@ impl Pipeline {
         let bangumi = Arc::new(
             BangumiClient::new(&cfg).map_err(|error| format!("build bangumi client: {error}"))?,
         );
+        let deepseek_fetch = DeepseekFetchClient::from_config(&cfg)
+            .map_err(|error| format!("build deepseek fetch client: {error}"))?
+            .map(Arc::new);
         Ok(Arc::new(Pipeline {
             cfg,
             store,
@@ -226,6 +243,7 @@ impl Pipeline {
             search,
             llm,
             bangumi,
+            deepseek_fetch,
         }))
     }
 
@@ -312,6 +330,7 @@ impl Pipeline {
             subjects_fetched: 0,
             subjects_processed: 0,
             items_published: 0,
+            weekday_only_count: 0,
             high_confidence: 0,
             medium_confidence: 0,
             review_count: 0,
@@ -322,6 +341,7 @@ impl Pipeline {
                 ..LlmStat::default()
             },
             fetch: FetchStat::default(),
+            deepseek_fetch: DeepseekFetchStat::default(),
             errors: Vec::new(),
         };
         let previous = self.load_state();
@@ -356,6 +376,10 @@ impl Pipeline {
                     selected.len(),
                     allowed_count
                 ));
+                self.fetcher.reset_failure_diagnostics();
+                if let Some(client) = &self.deepseek_fetch {
+                    client.reset_run();
+                }
                 let fetch_before = self.fetcher.stats();
                 let (outcomes, summary_updates) = self.process_all(selected, &season).await;
                 summary.subjects_processed = outcomes.len();
@@ -430,8 +454,42 @@ impl Pipeline {
                 last_error: stats.last_error,
             };
         }
+        self.apply_weekday_fallback(&mut outcomes);
         summary.search = aggregate_search(&outcomes);
-        summary.fetch = fetch_stat_from(&self.fetcher.stats().delta_since(&fetch_before));
+        let mut fetch = fetch_stat_from(&self.fetcher.stats().delta_since(&fetch_before));
+        fetch.failure_categories = self.fetcher.failure_categories();
+        fetch.top_failures = self.fetcher.failure_samples();
+        if !fetch.failure_categories.is_empty() {
+            let summary_line = fetch
+                .failure_categories
+                .iter()
+                .map(|category| format!("{}={}", category.category, category.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::info(format!("fetch failure categories: {summary_line}"));
+        }
+        for sample in &fetch.top_failures {
+            log::info(format!(
+                "fetch failure sample: {} {} status={:?} {}",
+                sample.domain, sample.category, sample.status, sample.reason
+            ));
+        }
+        summary.fetch = fetch;
+        summary.deepseek_fetch = self
+            .deepseek_fetch
+            .as_ref()
+            .map(|client| client.stats())
+            .unwrap_or_default();
+        if summary.deepseek_fetch.configured {
+            log::info(format!(
+                "deepseek fetch fallback: calls={} successes={} failures={} rate_limited={} budget_exhausted={}",
+                summary.deepseek_fetch.calls,
+                summary.deepseek_fetch.successes,
+                summary.deepseek_fetch.failures,
+                summary.deepseek_fetch.rate_limited,
+                summary.deepseek_fetch.budget_exhausted
+            ));
+        }
 
         let mut state = previous;
         let now = Utc::now();
@@ -459,6 +517,11 @@ impl Pipeline {
             summary.errors.push(format!("review: {error}"));
         }
         summary.items_published = schedule.items.len();
+        summary.weekday_only_count = schedule
+            .items
+            .iter()
+            .filter(|item| !item.time_known)
+            .count();
         summary.high_confidence = schedule
             .items
             .iter()
@@ -472,6 +535,34 @@ impl Pipeline {
         summary.review_count = review.conflicts;
         summary.unknown_count = review.missing;
         self.finalize(summary, started_instant)
+    }
+
+    /// Publish weekday-only rows for subjects whose time could not be verified.
+    ///
+    /// Runs after the LLM fallback so LLM suggestions are still attempted first.
+    /// Conflicts (status Review) stay in the review queue; only subjects with no
+    /// evidence at all (status Unknown) fall back to the Bangumi weekday.
+    fn apply_weekday_fallback(&self, outcomes: &mut [SubjectOutcome]) {
+        if !self.cfg.publish_weekday_only {
+            return;
+        }
+        for outcome in outcomes.iter_mut() {
+            if outcome.verification.is_published() {
+                continue;
+            }
+            if outcome.verification.status != ReviewStatus::Unknown {
+                continue;
+            }
+            let Some(weekday) = weekday_fallback(&outcome.subject) else {
+                continue;
+            };
+            outcome.verification.status = ReviewStatus::Published;
+            outcome.verification.confidence = Confidence::Unknown;
+            outcome.verification.resolved = None;
+            outcome.verification.reasons =
+                vec!["weekday_only_publish (time not verified)".to_string()];
+            outcome.weekday_only = Some(weekday);
+        }
     }
 
     fn finalize(&self, mut summary: RunSummary, started_instant: Instant) -> RunSummary {
@@ -546,6 +637,7 @@ impl Pipeline {
         let mut queries = Vec::new();
         if !subject.name.trim().is_empty() {
             queries.push(format!("{} 放送時間 毎週", subject.name));
+            queries.push(format!("{} 放送曜日 時間", subject.name));
         }
         if let Some(name_cn) = &subject.name_cn {
             if !name_cn.trim().is_empty() && name_cn != &subject.name {
@@ -598,7 +690,9 @@ impl Pipeline {
         }
         let mut seen_urls = BTreeSet::new();
         results.retain(|result| is_http_url(&result.url) && seen_urls.insert(result.url.clone()));
-        results.truncate(10);
+        // Multiple queries per subject (default 3) can return more candidates;
+        // keep the snippet/page evidence pool wider than before.
+        results.truncate(16);
         for result in &results {
             if !result.snippet.is_empty() {
                 llm_parts.push(format!("{} {}", result.title, result.snippet));
@@ -651,6 +745,21 @@ impl Pipeline {
                 }
                 Err(error) => {
                     log::debug(format!("fetch failed for {}: {error}", result.url));
+                    if let Some(page) = self.deepseek_page_fallback(&result.url).await {
+                        pages_loaded += 1;
+                        let corpus = page.corpus();
+                        llm_parts.push(format!(
+                            "{} {}",
+                            page.title,
+                            truncate_chars(&page.text, 1500)
+                        ));
+                        let provider = format!("{}:deepseek-fetch", result.provider);
+                        for candidate in
+                            page_candidates(&corpus, &names, &result.url, &domain, &provider)
+                        {
+                            add_candidate(&mut candidates, candidate);
+                        }
+                    }
                 }
             }
         }
@@ -690,6 +799,27 @@ impl Pipeline {
                         }
                         Err(error) => {
                             log::debug(format!("official site fetch failed for {site}: {error}"));
+                            if let Some(page) = self.deepseek_page_fallback(&site).await {
+                                let corpus = page.corpus();
+                                llm_parts.push(format!(
+                                    "{} {}",
+                                    page.title,
+                                    truncate_chars(&page.text, 1500)
+                                ));
+                                for slot in extract::extract_slots(&corpus) {
+                                    add_candidate(
+                                        &mut candidates,
+                                        candidate_from_slot(
+                                            &slot,
+                                            &site,
+                                            &domain,
+                                            "official_site:deepseek-fetch",
+                                            "deepseek_fetch",
+                                            &corpus,
+                                        ),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -706,6 +836,26 @@ impl Pipeline {
             verification,
             search_attempts: attempts,
             llm_text,
+            weekday_only: None,
+        }
+    }
+
+    /// Try the DeepSeek official server-side fetch endpoint when the local
+    /// fetch failed (anti-bot, TLS, region blocking, empty JS shell).
+    async fn deepseek_page_fallback(&self, url: &str) -> Option<DeepseekFetchPage> {
+        let client = self.deepseek_fetch.as_ref()?;
+        let domain = domain_of(url);
+        match client.fetch(url).await {
+            Ok(page) => {
+                log::debug(format!("deepseek server-side fetch succeeded for {domain}"));
+                Some(page)
+            }
+            Err(error) => {
+                log::debug(format!(
+                    "deepseek server-side fetch failed for {domain}: {error}"
+                ));
+                None
+            }
         }
     }
 
@@ -801,6 +951,7 @@ impl Pipeline {
             platform: subject.platform.clone(),
             candidates: outcome.candidates.clone(),
             resolved: outcome.verification.resolved.clone(),
+            weekday_only: outcome.weekday_only,
             confidence: outcome.verification.confidence,
             status: outcome.verification.status,
             review_reasons: outcome.verification.reasons.clone(),
@@ -814,11 +965,12 @@ impl Pipeline {
         };
         // Keep a previously resolved slot when a run finds no new evidence at
         // all (transient search/fetch failures must not erase published data).
-        if entry.candidates.is_empty() && entry.resolved.is_none() {
+        if entry.candidates.is_empty() && entry.resolved.is_none() && entry.weekday_only.is_none() {
             if let Some(previous) = &existing {
-                if previous.resolved.is_some() {
+                if previous.resolved.is_some() || previous.weekday_only.is_some() {
                     entry.candidates = previous.candidates.clone();
                     entry.resolved = previous.resolved.clone();
+                    entry.weekday_only = previous.weekday_only;
                     entry.confidence = previous.confidence;
                     entry.status = previous.status;
                     entry.review_reasons = previous.review_reasons.clone();
@@ -827,8 +979,10 @@ impl Pipeline {
                 }
             }
         }
-        if let (Some(resolved), Some(previous)) = (&entry.resolved, &existing) {
-            if previous.resolved.as_ref() == Some(resolved) {
+        if let Some(previous) = &existing {
+            let same_resolution = previous.resolved.as_ref() == entry.resolved.as_ref()
+                && previous.weekday_only == entry.weekday_only;
+            if same_resolution {
                 entry.updated_at = previous.updated_at;
             }
         }
@@ -846,18 +1000,38 @@ impl Pipeline {
             .values()
             .filter(|subject| &subject.season == season && subject.is_published())
             .filter_map(|subject| {
-                let resolved = subject.resolved.as_ref()?;
+                let (weekday, time, time_known, confidence, sources) =
+                    if let Some(resolved) = subject.resolved.as_ref() {
+                        (
+                            resolved.weekday,
+                            Some(resolved.time.clone()),
+                            true,
+                            subject.confidence,
+                            collect_sources(subject, resolved),
+                        )
+                    } else {
+                        // weekday-only fallback row: known weekday, unknown clock
+                        let weekday = subject.weekday_only?;
+                        (
+                            weekday,
+                            None,
+                            false,
+                            Confidence::Unknown,
+                            collect_weekday_sources(subject, weekday),
+                        )
+                    };
                 Some(ScheduleItem {
                     subject_id: subject.subject_id,
                     name: subject.name.clone(),
                     name_cn: subject.name_cn.clone(),
                     air_date: subject.air_date,
                     image: subject.image.clone(),
-                    weekday: resolved.weekday,
-                    time: resolved.time.clone(),
+                    weekday,
+                    time,
+                    time_known,
                     timezone: SCHEDULE_TIMEZONE.to_string(),
-                    confidence: subject.confidence,
-                    sources: collect_sources(subject, resolved),
+                    confidence,
+                    sources,
                     updated_at: subject.updated_at,
                 })
             })
@@ -865,6 +1039,8 @@ impl Pipeline {
         items.sort_by(|left, right| {
             left.weekday
                 .cmp(&right.weekday)
+                // Timed rows first within a weekday, then weekday-only rows.
+                .then_with(|| right.time_known.cmp(&left.time_known))
                 .then_with(|| left.time.cmp(&right.time))
                 .then_with(|| left.name.cmp(&right.name))
         });
@@ -969,10 +1145,69 @@ fn snippet_candidates(result: &SearchResult, names: &[String]) -> Vec<TimeCandid
     let corpus = format!("{} {}", result.title, result.snippet);
     let domain = domain_of(&result.url);
     let provider = format!("{}:snippet", result.provider);
-    extract::extract_for_subject(&corpus, names)
-        .into_iter()
-        .map(|slot| candidate_from_slot(&slot, &result.url, &domain, &provider, "snippet", &corpus))
-        .collect()
+    let mut candidates: Vec<TimeCandidate> = Vec::new();
+    // Strict pass: the title must be close to the time (row / heading context).
+    for slot in extract::extract_for_subject(&corpus, names) {
+        add_candidate(
+            &mut candidates,
+            candidate_from_slot(&slot, &result.url, &domain, &provider, "snippet", &corpus),
+        );
+    }
+    // Lenient pass: when the search result title/snippet mentions the show
+    // anywhere, also accept slots far from the title occurrence. This recovers
+    // pages whose title is in the page header and the schedule further down.
+    if extract::text_mentions_title(&corpus, names) {
+        let lenient_provider = format!("{provider}-lenient");
+        for slot in extract::extract_slots(&corpus) {
+            add_candidate(
+                &mut candidates,
+                candidate_from_slot(
+                    &slot,
+                    &result.url,
+                    &domain,
+                    &lenient_provider,
+                    "snippet-lenient",
+                    &corpus,
+                ),
+            );
+        }
+    }
+    candidates
+}
+
+/// Candidates from a server-side fetched page: strict title context first,
+/// then lenient title-anywhere extraction.
+fn page_candidates(
+    corpus: &str,
+    names: &[String],
+    url: &str,
+    domain: &str,
+    provider: &str,
+) -> Vec<TimeCandidate> {
+    let mut candidates: Vec<TimeCandidate> = Vec::new();
+    for slot in extract::extract_for_subject(corpus, names) {
+        add_candidate(
+            &mut candidates,
+            candidate_from_slot(&slot, url, domain, provider, "deepseek_fetch", corpus),
+        );
+    }
+    if extract::text_mentions_title(corpus, names) {
+        let lenient_provider = format!("{provider}-lenient");
+        for slot in extract::extract_slots(corpus) {
+            add_candidate(
+                &mut candidates,
+                candidate_from_slot(
+                    &slot,
+                    url,
+                    domain,
+                    &lenient_provider,
+                    "deepseek_fetch-lenient",
+                    corpus,
+                ),
+            );
+        }
+    }
+    candidates
 }
 
 fn add_candidate(candidates: &mut Vec<TimeCandidate>, candidate: TimeCandidate) {
@@ -1016,6 +1251,35 @@ fn collect_sources(
     sources
 }
 
+fn collect_weekday_sources(subject: &SubjectState, weekday: u8) -> Vec<ScheduleSource> {
+    let mut seen_domains = BTreeSet::new();
+    let mut sources = Vec::new();
+    for candidate in &subject.candidates {
+        if candidate.weekday != Some(weekday) {
+            continue;
+        }
+        let Some(url) = &candidate.source_url else {
+            continue;
+        };
+        if seen_domains.insert(candidate.source_domain.clone()) {
+            sources.push(ScheduleSource {
+                url: url.clone(),
+                domain: candidate.source_domain.clone(),
+                provider: candidate.provider.clone(),
+            });
+        }
+    }
+    if sources.is_empty() {
+        // Provenance for rows that only rely on Bangumi metadata.
+        sources.push(ScheduleSource {
+            url: format!("https://bgm.tv/subject/{}", subject.subject_id),
+            domain: "bgm.tv".to_string(),
+            provider: "bangumi".to_string(),
+        });
+    }
+    sources
+}
+
 fn aggregate_search(outcomes: &[SubjectOutcome]) -> Vec<ProviderStat> {
     let mut map: BTreeMap<String, ProviderStat> = BTreeMap::new();
     for outcome in outcomes {
@@ -1050,6 +1314,8 @@ fn fetch_stat_from(stats: &FetchStats) -> FetchStat {
         failures_timeout: stats.failures_timeout,
         failures_http: stats.failures_http,
         failures_other: stats.failures_other,
+        failure_categories: Vec::new(),
+        top_failures: Vec::new(),
     }
 }
 
@@ -1192,6 +1458,47 @@ mod tests {
         assert!(!verification.is_published());
     }
 
+    fn fake_subject_with_weekday(
+        id: u64,
+        weekday_hint: Option<u8>,
+        air_date: Option<chrono::NaiveDate>,
+    ) -> crate::bangumi::BangumiSubject {
+        crate::bangumi::BangumiSubject {
+            id,
+            name: format!("Subject {id}"),
+            name_cn: None,
+            air_date,
+            platform: Some("TV".to_string()),
+            image: None,
+            official_site: None,
+            weekday_hint,
+        }
+    }
+
+    fn published_state(id: u64, weekday_only: Option<u8>) -> SubjectState {
+        let now = Utc::now();
+        SubjectState {
+            subject_id: id,
+            name: format!("Subject {id}"),
+            name_cn: None,
+            season: SeasonRef::new(2026, crate::season::Season::Fall),
+            air_date: None,
+            image: None,
+            official_site: None,
+            platform: Some("TV".to_string()),
+            candidates: Vec::new(),
+            resolved: None,
+            weekday_only,
+            confidence: Confidence::Unknown,
+            status: ReviewStatus::Published,
+            review_reasons: Vec::new(),
+            carried_over: false,
+            first_seen_at: now,
+            last_checked_at: now,
+            updated_at: now,
+        }
+    }
+
     fn fake_subject(id: u64) -> crate::bangumi::BangumiSubject {
         crate::bangumi::BangumiSubject {
             id,
@@ -1249,6 +1556,141 @@ mod tests {
             provider: "brave".to_string(),
         };
         assert!(snippet_candidates(&result, &["作品A".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn weekday_fallback_prefers_infobox_then_air_date() {
+        let air_date = chrono::NaiveDate::from_ymd_opt(2026, 10, 3).unwrap(); // Saturday
+        let subject = fake_subject_with_weekday(1, Some(6), Some(air_date));
+        assert_eq!(weekday_fallback(&subject), Some(6));
+        let subject = fake_subject_with_weekday(2, None, Some(air_date));
+        assert_eq!(weekday_fallback(&subject), Some(6));
+        let subject = fake_subject_with_weekday(3, None, None);
+        assert_eq!(weekday_fallback(&subject), None);
+    }
+
+    #[test]
+    fn weekday_only_fallback_marks_unknown_but_keeps_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(crate::config::Config::for_tests(dir.path().to_path_buf()));
+        let pipeline = Pipeline::new(cfg).unwrap();
+        let unknown = SubjectOutcome {
+            subject: fake_subject_with_weekday(1, Some(6), None),
+            candidates: Vec::new(),
+            verification: Verification {
+                resolved: None,
+                confidence: Confidence::Unknown,
+                status: ReviewStatus::Unknown,
+                reasons: vec!["no_time_found".to_string()],
+                domains: Vec::new(),
+            },
+            search_attempts: Vec::new(),
+            llm_text: String::new(),
+            weekday_only: None,
+        };
+        let conflict = SubjectOutcome {
+            subject: fake_subject_with_weekday(2, Some(7), None),
+            candidates: Vec::new(),
+            verification: Verification {
+                resolved: None,
+                confidence: Confidence::Low,
+                status: ReviewStatus::Review,
+                reasons: vec!["conflict".to_string()],
+                domains: Vec::new(),
+            },
+            search_attempts: Vec::new(),
+            llm_text: String::new(),
+            weekday_only: None,
+        };
+        let mut outcomes = vec![unknown, conflict];
+        pipeline.apply_weekday_fallback(&mut outcomes);
+        assert_eq!(outcomes[0].verification.status, ReviewStatus::Published);
+        assert_eq!(outcomes[0].verification.confidence, Confidence::Unknown);
+        assert_eq!(outcomes[0].weekday_only, Some(6));
+        assert_eq!(outcomes[1].verification.status, ReviewStatus::Review);
+        assert_eq!(outcomes[1].weekday_only, None);
+    }
+
+    #[test]
+    fn schedule_contains_timed_and_weekday_only_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(crate::config::Config::for_tests(dir.path().to_path_buf()));
+        let pipeline = Pipeline::new(cfg).unwrap();
+        let now = Utc::now();
+        let mut state = StateFile::empty();
+        let mut timed = published_state(10, None);
+        timed.resolved = Some(crate::model::ResolvedSlot::new(6, "23:30"));
+        timed.confidence = Confidence::High;
+        state.subjects.insert("10".to_string(), timed);
+        state
+            .subjects
+            .insert("11".to_string(), published_state(11, Some(7)));
+        let schedule = pipeline.build_schedule(
+            &state,
+            &SeasonRef::new(2026, crate::season::Season::Fall),
+            now,
+        );
+        assert_eq!(schedule.items.len(), 2);
+        let timed_item = schedule
+            .items
+            .iter()
+            .find(|item| item.subject_id == 10)
+            .unwrap();
+        assert_eq!(timed_item.time.as_deref(), Some("23:30"));
+        assert!(timed_item.time_known);
+        let weekday_item = schedule
+            .items
+            .iter()
+            .find(|item| item.subject_id == 11)
+            .unwrap();
+        assert!(weekday_item.time.is_none());
+        assert!(!weekday_item.time_known);
+        assert_eq!(weekday_item.weekday, 7);
+        assert_eq!(weekday_item.confidence, Confidence::Unknown);
+        assert!(weekday_item
+            .sources
+            .iter()
+            .any(|source| source.provider == "bangumi"));
+    }
+
+    #[test]
+    fn snippet_candidates_accept_title_far_from_time_with_lenient_fallback() {
+        // Multi-line corpus: the title is only on the first line, while the
+        // schedule sits in a table row for another listing. Strict row-level
+        // context rejects it; the lenient title-anywhere pass recovers it.
+        let filler = "無関係な文章".repeat(80);
+        let result = SearchResult {
+            title: "作品A".to_string(),
+            url: "https://example.com/a".to_string(),
+            snippet: format!("{filler}\n他作品 | 毎週土曜 23:30 放送"),
+            provider: "deepseek".to_string(),
+        };
+        let candidates = snippet_candidates(&result, &["作品A".to_string()]);
+        assert!(candidates.iter().any(|candidate| {
+            candidate.weekday == Some(6)
+                && candidate.time.as_deref() == Some("23:30")
+                && candidate.method.contains("snippet-lenient")
+        }));
+    }
+
+    #[test]
+    fn deepseek_fetch_page_candidates_extract_times() {
+        let corpus = "作品A\n放送情報\n毎週土曜 23:30 放送";
+        let candidates = page_candidates(
+            corpus,
+            &["作品A".to_string()],
+            "https://example.com/schedule",
+            "example.com",
+            "deepseek:fetch",
+        );
+        assert!(candidates.iter().any(|candidate| {
+            candidate.weekday == Some(6)
+                && candidate.time.as_deref() == Some("23:30")
+                && candidate.method.contains("deepseek_fetch")
+        }));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.source_domain == "example.com"));
     }
 
     #[test]

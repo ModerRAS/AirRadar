@@ -160,6 +160,7 @@ impl SearchRouter {
                             key,
                             cfg.deepseek_search_url.clone(),
                             cfg.deepseek_search_model.clone(),
+                            cfg.deepseek_search_count,
                             &cfg.fetch_ua,
                             cfg.search_timeout_secs,
                         )?));

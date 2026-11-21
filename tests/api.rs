@@ -145,8 +145,27 @@ async fn latest_returns_published_schedule() {
     assert_eq!(body["itemCount"], 1);
     assert_eq!(body["items"][0]["weekday"], 3);
     assert_eq!(body["items"][0]["time"], "23:00");
+    // Old payloads without timeKnown are treated as timed rows.
+    assert_eq!(body["items"][0]["timeKnown"], true);
     assert_eq!(body["items"][0]["timezone"], "Asia/Tokyo");
     assert_eq!(body["items"][0]["confidence"], "high");
+}
+
+#[tokio::test]
+async fn weekday_only_rows_serialise_null_time_and_time_known_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(dir.path(), MockController::new());
+    let mut schedule = sample_schedule();
+    schedule.items[0].time = None;
+    schedule.items[0].time_known = false;
+    schedule.items[0].confidence = airradar::model::Confidence::Unknown;
+    state.store.publish(&schedule, 5).unwrap();
+    let router = airradar::api::router(state);
+    let (status, body) = call(router, "GET", "/api/schedule/latest", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["items"][0]["time"].is_null());
+    assert_eq!(body["items"][0]["timeKnown"], false);
+    assert_eq!(body["items"][0]["confidence"], "unknown");
 }
 
 #[tokio::test]
