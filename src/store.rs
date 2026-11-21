@@ -352,6 +352,7 @@ mod tests {
             time_known: true,
             timezone: "Asia/Tokyo".to_string(),
             confidence: Confidence::High,
+            disputed: false,
             sources: vec![ScheduleSource {
                 url: "https://example.com/schedule".to_string(),
                 domain: "example.com".to_string(),

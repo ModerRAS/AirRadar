@@ -17,6 +17,9 @@ pub struct Verification {
     pub reasons: Vec<String>,
     /// Independent source domains behind the winning slot (sorted).
     pub domains: Vec<String>,
+    /// True when a disputed slot is still published (winning evidence has more
+    /// independent domains than the dissent).
+    pub disputed: bool,
 }
 
 impl Verification {
@@ -31,6 +34,7 @@ impl Verification {
             status: ReviewStatus::Unknown,
             reasons,
             domains: Vec::new(),
+            disputed: false,
         }
     }
 }
@@ -115,6 +119,7 @@ pub fn verify(candidates: &[TimeCandidate]) -> Verification {
         .map(|(slot, _)| slot)
         .collect();
 
+    // A tie between equally strong slots stays in review.
     if top_slots.len() > 1 {
         return Verification {
             resolved: None,
@@ -122,56 +127,73 @@ pub fn verify(candidates: &[TimeCandidate]) -> Verification {
             status: ReviewStatus::Review,
             reasons: vec![conflict_reason(&slots, None)],
             domains: Vec::new(),
+            disputed: false,
         };
     }
 
     let winning = top_slots[0];
     let winning_domains = &slots[winning];
-    let other_conflicts: Vec<&(u8, String)> = slots
+    let winning_count = winning_domains.len();
+    let dissent_domains: BTreeSet<String> = slots
         .iter()
-        .filter(|(slot, domains)| {
-            *slot != winning
-                && domains
-                    .iter()
-                    .any(|domain| !winning_domains.contains(domain))
-        })
-        .map(|(slot, _)| slot)
+        .filter(|(slot, _)| *slot != winning)
+        .flat_map(|(_, domains)| domains.iter().cloned())
+        .filter(|domain| !winning_domains.contains(domain))
         .collect();
+    let dissent_count = dissent_domains.len();
+    let domains: Vec<String> = winning_domains.iter().cloned().collect();
 
-    if !other_conflicts.is_empty() {
+    if dissent_count > 0 {
+        // Disputed policy: publish a low-confidence row only when the winning
+        // slot is backed by at least two independent domains and the dissent is
+        // strictly smaller. Ties and single-source conflicts stay in review.
+        if winning_count >= 2 && dissent_count < winning_count {
+            let dissent = dissent_domains
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Verification {
+                resolved: Some(ResolvedSlot::new(winning.0, winning.1.clone())),
+                confidence: Confidence::Low,
+                status: ReviewStatus::Published,
+                reasons: vec![format!(
+                    "disputed: winner {} <- {}; dissent <- {}",
+                    slot_label(winning.0, &winning.1),
+                    domains.join(", "),
+                    dissent
+                )],
+                domains,
+                disputed: true,
+            };
+        }
         return Verification {
             resolved: None,
             confidence: Confidence::Low,
             status: ReviewStatus::Review,
             reasons: vec![conflict_reason(&slots, Some(winning))],
             domains: Vec::new(),
+            disputed: false,
         };
     }
 
-    let domains: Vec<String> = winning_domains.iter().cloned().collect();
-    if best >= 2 {
+    if winning_count >= 2 {
         Verification {
             resolved: Some(ResolvedSlot::new(winning.0, winning.1.clone())),
             confidence: Confidence::High,
             status: ReviewStatus::Published,
             reasons: Vec::new(),
             domains,
+            disputed: false,
         }
-    } else if slots.len() == 1 {
+    } else {
         Verification {
             resolved: Some(ResolvedSlot::new(winning.0, winning.1.clone())),
             confidence: Confidence::Medium,
             status: ReviewStatus::Published,
             reasons: vec!["single_source".to_string()],
             domains,
-        }
-    } else {
-        Verification {
-            resolved: None,
-            confidence: Confidence::Low,
-            status: ReviewStatus::Review,
-            reasons: vec![conflict_reason(&slots, Some(winning))],
-            domains: Vec::new(),
+            disputed: false,
         }
     }
 }
@@ -241,17 +263,55 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_sources_go_to_review() {
+    fn majority_with_two_independent_sources_publishes_disputed_low() {
         let verification = verify(&[
             candidate(6, "23:30", "a.example"),
             candidate(6, "23:30", "b.example"),
             candidate(7, "01:15", "c.example"),
         ]);
-        assert_eq!(verification.status, ReviewStatus::Review);
+        assert_eq!(verification.status, ReviewStatus::Published);
         assert_eq!(verification.confidence, Confidence::Low);
-        assert!(verification.resolved.is_none());
-        assert!(verification.reasons[0].contains("conflict"));
+        assert!(verification.disputed);
+        assert_eq!(verification.resolved, Some(ResolvedSlot::new(6, "23:30")));
+        assert!(verification.reasons[0].contains("disputed"));
         assert!(verification.reasons[0].contains("c.example"));
+    }
+
+    #[test]
+    fn dissent_tie_stays_in_review() {
+        let verification = verify(&[
+            candidate(6, "23:30", "a.example"),
+            candidate(6, "23:30", "b.example"),
+            candidate(7, "01:15", "c.example"),
+            candidate(7, "01:15", "d.example"),
+        ]);
+        assert_eq!(verification.status, ReviewStatus::Review);
+        assert!(!verification.disputed);
+        assert!(verification.resolved.is_none());
+    }
+
+    #[test]
+    fn single_source_conflict_stays_in_review() {
+        let verification = verify(&[
+            candidate(6, "23:30", "a.example"),
+            candidate(7, "01:15", "b.example"),
+        ]);
+        assert_eq!(verification.status, ReviewStatus::Review);
+        assert!(!verification.disputed);
+    }
+
+    #[test]
+    fn large_majority_can_publish_disputed() {
+        let verification = verify(&[
+            candidate(6, "23:30", "a.example"),
+            candidate(6, "23:30", "b.example"),
+            candidate(6, "23:30", "c.example"),
+            candidate(7, "01:15", "d.example"),
+            candidate(7, "01:15", "e.example"),
+        ]);
+        assert_eq!(verification.status, ReviewStatus::Published);
+        assert_eq!(verification.confidence, Confidence::Low);
+        assert!(verification.disputed);
     }
 
     #[test]

@@ -136,6 +136,9 @@ pub struct SubjectState {
     /// confidence unknown if PUBLISH_WEEKDAY_ONLY is enabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekday_only: Option<u8>,
+    /// True when a low-confidence disputed slot was published instead of held.
+    #[serde(default)]
+    pub disputed: bool,
     #[serde(default)]
     pub confidence: Confidence,
     #[serde(default)]
@@ -208,6 +211,9 @@ pub struct ScheduleItem {
     pub time_known: bool,
     pub timezone: String,
     pub confidence: Confidence,
+    /// True when independent sources disagreed but the majority still won.
+    #[serde(default)]
+    pub disputed: bool,
     pub sources: Vec<ScheduleSource>,
     pub updated_at: DateTime<Utc>,
 }
@@ -389,6 +395,9 @@ pub struct RunSummary {
     /// Published rows that only have a weekday (time unknown).
     #[serde(default)]
     pub weekday_only_count: usize,
+    /// Published rows with disputed evidence (low confidence majority).
+    #[serde(default)]
+    pub disputed_count: usize,
     pub high_confidence: usize,
     pub medium_confidence: usize,
     pub review_count: usize,

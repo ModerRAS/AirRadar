@@ -252,7 +252,7 @@ impl Config {
         let max_llm_calls = clamp(parse_or(&map, "MAX_LLM_CALLS", 40usize)?, 0, 100);
         let max_search_calls = clamp(parse_or(&map, "MAX_SEARCH_CALLS", 400usize)?, 0, 2000);
         let search_queries_per_subject =
-            clamp(parse_or(&map, "SEARCH_QUERIES_PER_SUBJECT", 2usize)?, 1, 5);
+            clamp(parse_or(&map, "SEARCH_QUERIES_PER_SUBJECT", 3usize)?, 1, 5);
         let fetch_pages_per_subject =
             clamp(parse_or(&map, "FETCH_PAGES_PER_SUBJECT", 3usize)?, 0, 5);
         let fetch_timeout_secs = clamp(parse_or(&map, "FETCH_TIMEOUT_SECS", 15u64)?, 1, 120);
@@ -284,7 +284,7 @@ impl Config {
         let llm_api_key = secret(&map, "LLM_API_KEY")?;
         let llm_model = text(&map, "LLM_MODEL");
         let llm_session_id = text(&map, "LLM_SESSION_ID");
-        let deepseek_search_count = clamp(parse_or(&map, "DEEPSEEK_SEARCH_COUNT", 10usize)?, 1, 50);
+        let deepseek_search_count = clamp(parse_or(&map, "DEEPSEEK_SEARCH_COUNT", 12usize)?, 1, 50);
         let deepseek_fetch_url = text(&map, "DEEPSEEK_FETCH_URL")
             .unwrap_or_else(|| "https://api.deepseek.com/v1/tools/fetch".to_string());
         let max_deepseek_fetch_calls = clamp(
@@ -362,7 +362,7 @@ impl Config {
             deepseek_api_key: None,
             deepseek_search_url: "https://api.deepseek.com/v1/tools/search".to_string(),
             deepseek_search_model: "deepseek-chat".to_string(),
-            deepseek_search_count: 10,
+            deepseek_search_count: 12,
             deepseek_fetch_url: "https://api.deepseek.com/v1/tools/fetch".to_string(),
             max_deepseek_fetch_calls: 0,
             llm_base_url: None,
@@ -427,8 +427,8 @@ mod tests {
         assert_eq!(config.max_subjects_per_run, 120);
         assert_eq!(config.max_search_calls, 400);
         assert_eq!(config.max_llm_calls, 40);
-        assert_eq!(config.search_queries_per_subject, 2);
-        assert_eq!(config.deepseek_search_count, 10);
+        assert_eq!(config.search_queries_per_subject, 3);
+        assert_eq!(config.deepseek_search_count, 12);
         assert_eq!(
             config.deepseek_search_url,
             "https://api.deepseek.com/v1/tools/search"
