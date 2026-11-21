@@ -3,10 +3,10 @@ name: diagnose
 on:
   workflow_dispatch:
     inputs:
-      script:
-        description: "Bash script to run on the Swarm manager (diagnostics only)"
+      script_b64:
+        description: "Base64-encoded bash script to run on the Swarm manager (diagnostics only)"
         required: true
-        default: "docker service ps airradar_airradar --no-trunc; docker service logs --tail 80 airradar_airradar"
+        default: "ZWNobyA9PT0gc2VydmljZSA9PT07IGRvY2tlciBzZXJ2aWNlIHBzIGFpcnJhZGFyX2FpcnJhZGFyIC0tbm8tdHJ1bmM7IGRvY2tlciBzZXJ2aWNlIGxvZ3MgLS10YWlsIDgwIGFpcnJhZGFyX2FpcnJhZGFy"
 
 permissions:
   contents: read
@@ -23,7 +23,6 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
-          script_stop: true
+          script_stop: false
           script: |
-            set -x
-            ${{ inputs.script }}
+            echo "${{ inputs.script_b64 }}" | base64 -d | bash -s
