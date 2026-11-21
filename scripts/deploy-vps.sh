@@ -202,7 +202,13 @@ done
 if [ "$converged" != "1" ]; then
   log "service did not converge; diagnostics follow"
   docker service ps "$(printf '%s_airradar' "$STACK_NAME")" --no-trunc 2>&1 || true
-  docker service logs --tail 120 "$(printf '%s_airradar' "$STACK_NAME")" 2>&1 || true
+  service="$(printf '%s_airradar' "$STACK_NAME")"
+  for task in $(docker service ps "$service" -q --no-trunc 2>/dev/null | head -n 4); do
+    docker inspect --format 'task {{.ID}} node={{.NodeID}} state={{.Status.State}} err={{.Status.Err}} exit={{.Status.ContainerStatus.ExitCode}} container={{.Status.ContainerStatus.ContainerID}}' "$task" 2>&1 || true
+    cid="$(docker inspect --format '{{.Status.ContainerStatus.ContainerID}}' "$task" 2>/dev/null || true)"
+    if [ -n "$cid" ]; then docker logs --tail 80 "$cid" 2>&1 || true; fi
+  done
+  docker service logs --raw --tail 300 "$service" 2>&1 || true
   df -h / /var/lib/docker 2>/dev/null || true
   docker system df 2>/dev/null || true
   die "service failed to converge (see task state/logs above)"
