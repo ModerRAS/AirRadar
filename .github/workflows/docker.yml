@@ -53,6 +53,13 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build image locally for smoke test
+        run: docker build -t airradar-ci .
+      - name: Verify image entrypoint
+        run: |
+          out=$(docker run --rm airradar-ci --version)
+          echo "binary reports: $out"
+          echo "$out" | grep -q "^airradar "
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

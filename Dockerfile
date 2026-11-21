@@ -14,8 +14,13 @@ RUN mkdir -p src \
 
 # 2) Compile the real crate.
 COPY src ./src
+# The stub binary from the dependency-cache stage must not survive into the real
+# build. BuildKit preserves source mtimes, so Cargo can otherwise consider the
+# stub up to date and ship a binary whose main() is empty.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --locked
+    rm -f target/release/airradar \
+    && touch src/main.rs src/lib.rs \
+    && cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 
