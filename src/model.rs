@@ -298,6 +298,15 @@ pub struct FetchStat {
     pub fetched: usize,
     pub from_cache: usize,
     pub failed: usize,
+    /// Extra requests made by the one-shot retry.
+    #[serde(default)]
+    pub retried: usize,
+    #[serde(default)]
+    pub failures_timeout: usize,
+    #[serde(default)]
+    pub failures_http: usize,
+    #[serde(default)]
+    pub failures_other: usize,
 }
 
 /// Result of one collection run (persisted in /data/status.json).

@@ -133,6 +133,9 @@ pub struct Config {
     pub refresh_hours: f64,
     pub max_subjects_per_run: usize,
     pub season_override: Option<SeasonRef>,
+    /// Days pulled back from the calendar season start so pre-season (late
+    /// September for fall) premieres are included in the broadcast window.
+    pub season_padding_days: u32,
     /// Empty vector means all platforms are accepted.
     pub include_platforms: Vec<String>,
     pub enable_official_site: bool,
@@ -232,11 +235,12 @@ impl Config {
             )));
         }
 
-        let max_subjects_per_run = clamp(parse_or(&map, "MAX_SUBJECTS_PER_RUN", 30usize)?, 1, 200);
+        let max_subjects_per_run = clamp(parse_or(&map, "MAX_SUBJECTS_PER_RUN", 120usize)?, 1, 200);
+        let season_padding_days = clamp(parse_or(&map, "SEASON_PADDING_DAYS", 10u32)?, 0, 30);
         let fetch_concurrency = clamp(parse_or(&map, "FETCH_CONCURRENCY", 4usize)?, 1, 8);
         let history_keep = clamp(parse_or(&map, "HISTORY_KEEP", 10usize)?, 1, 10);
-        let max_llm_calls = clamp(parse_or(&map, "MAX_LLM_CALLS", 10usize)?, 0, 50);
-        let max_search_calls = clamp(parse_or(&map, "MAX_SEARCH_CALLS", 60usize)?, 0, 1000);
+        let max_llm_calls = clamp(parse_or(&map, "MAX_LLM_CALLS", 40usize)?, 0, 100);
+        let max_search_calls = clamp(parse_or(&map, "MAX_SEARCH_CALLS", 240usize)?, 0, 2000);
         let search_queries_per_subject =
             clamp(parse_or(&map, "SEARCH_QUERIES_PER_SUBJECT", 2usize)?, 1, 5);
         let fetch_pages_per_subject =
@@ -301,6 +305,7 @@ impl Config {
             refresh_hours,
             max_subjects_per_run,
             season_override,
+            season_padding_days,
             include_platforms,
             enable_official_site: parse_bool_or(&map, "ENABLE_OFFICIAL_SITE", true)?,
             fetch_timeout_secs,
@@ -347,6 +352,7 @@ impl Config {
             refresh_hours: 6.0,
             max_subjects_per_run: 2,
             season_override: None,
+            season_padding_days: 10,
             include_platforms: vec!["TV".to_string()],
             enable_official_site: false,
             fetch_timeout_secs: 5,
@@ -392,7 +398,10 @@ mod tests {
         let config = Config::from_pairs(&[]).unwrap();
         assert_eq!(config.port, 8080);
         assert_eq!(config.refresh_hours, 6.0);
-        assert_eq!(config.max_subjects_per_run, 30);
+        assert_eq!(config.max_subjects_per_run, 120);
+        assert_eq!(config.max_search_calls, 240);
+        assert_eq!(config.max_llm_calls, 40);
+        assert_eq!(config.season_padding_days, 10);
         assert_eq!(config.history_keep, 10);
         assert_eq!(config.cache_dir, PathBuf::from("./data").join("cache"));
         assert_eq!(config.search_order, ProviderKind::ALL.to_vec());
@@ -409,6 +418,7 @@ mod tests {
             ("DATA_DIR", "D:/airradar-data"),
             ("REFRESH_HOURS", "1.5"),
             ("MAX_SUBJECTS_PER_RUN", "500"),
+            ("SEASON_PADDING_DAYS", "14"),
             ("HISTORY_KEEP", "99"),
             ("SEARCH_PROVIDER_ORDER", "tavily,brave,tavily"),
             ("INCLUDE_PLATFORMS", "TV, WEB , ON A"),
@@ -424,6 +434,7 @@ mod tests {
         );
         assert_eq!(config.refresh_hours, 1.5);
         assert_eq!(config.max_subjects_per_run, 200);
+        assert_eq!(config.season_padding_days, 14);
         assert_eq!(config.history_keep, 10);
         assert_eq!(
             config.search_order,
@@ -449,6 +460,14 @@ mod tests {
         assert!(error.message.contains("SEASON_OVERRIDE"));
         let error = Config::from_pairs(&pairs(&[("PUBLISH_MEDIUM", "maybe")])).unwrap_err();
         assert!(error.message.contains("PUBLISH_MEDIUM"));
+    }
+
+    #[test]
+    fn season_padding_is_clamped() {
+        let config = Config::from_pairs(&pairs(&[("SEASON_PADDING_DAYS", "999")])).unwrap();
+        assert_eq!(config.season_padding_days, 30);
+        let config = Config::from_pairs(&pairs(&[("SEASON_PADDING_DAYS", "0")])).unwrap();
+        assert_eq!(config.season_padding_days, 0);
     }
 
     #[test]

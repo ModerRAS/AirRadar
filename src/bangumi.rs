@@ -18,7 +18,10 @@ use crate::util::truncate_chars;
 
 const DEFAULT_BASE: &str = "https://api.bgm.tv";
 const PAGE_LIMIT: usize = 100;
-const MAX_PAGES: usize = 4;
+/// Safety bound for pagination. The API currently returns ~20 items per page
+/// even when a larger limit is requested, so 4 pages used to cap every run at
+/// ~80 subjects; 25 pages covers a full ~300-subject window.
+const MAX_PAGES: usize = 25;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Bangumi API failure.
@@ -101,8 +104,9 @@ impl BangumiClient {
         &self,
         season: &SeasonRef,
         max: usize,
+        padding_days: u32,
     ) -> Result<(Vec<BangumiSubject>, SubjectListSource), BangumiError> {
-        match self.search_season(season, max).await {
+        match self.search_season(season, max, padding_days).await {
             Ok(subjects) if !subjects.is_empty() => {
                 return Ok((subjects, SubjectListSource::Search));
             }
@@ -116,7 +120,7 @@ impl BangumiClient {
             }
         }
         let mut subjects = self.calendar().await?;
-        subjects = filter_by_season(subjects, season);
+        subjects = filter_by_season(subjects, season, padding_days);
         Ok((subjects, SubjectListSource::Calendar))
     }
 
@@ -125,21 +129,13 @@ impl BangumiClient {
         &self,
         season: &SeasonRef,
         max: usize,
+        padding_days: u32,
     ) -> Result<Vec<BangumiSubject>, BangumiError> {
-        let start = season.start();
-        let end = season.end_exclusive();
         let page_limit = max.clamp(1, PAGE_LIMIT);
         let mut collected: Vec<BangumiSubject> = Vec::new();
         let mut offset = 0usize;
         for _page in 0..MAX_PAGES {
-            let body = json!({
-                "keyword": "",
-                "sort": "match",
-                "filter": {
-                    "type": [2],
-                    "air_date": [format!(">={start}"), format!("<{end}")]
-                }
-            });
+            let body = season_search_body(season, padding_days);
             let url = format!(
                 "{}/v0/search/subjects?limit={page_limit}&offset={offset}",
                 self.base_url
@@ -383,9 +379,30 @@ pub fn parse_calendar_response(value: &Value) -> Vec<BangumiSubject> {
     subjects
 }
 
-/// Keep only subjects whose air_date falls inside the season.
-pub fn filter_by_season(subjects: Vec<BangumiSubject>, season: &SeasonRef) -> Vec<BangumiSubject> {
-    let start = season.start();
+/// JSON body for POST /v0/search/subjects covering the broadcast window.
+///
+/// The air_date lower bound is pulled back by padding_days so late-September
+/// (fall) and equivalent pre-season premieres are included.
+pub fn season_search_body(season: &SeasonRef, padding_days: u32) -> Value {
+    let start = season.broadcast_start(padding_days);
+    let end = season.end_exclusive();
+    json!({
+        "keyword": "",
+        "sort": "match",
+        "filter": {
+            "type": [2],
+            "air_date": [format!(">={start}"), format!("<{end}")]
+        }
+    })
+}
+
+/// Keep only subjects whose air_date falls inside the broadcast window.
+pub fn filter_by_season(
+    subjects: Vec<BangumiSubject>,
+    season: &SeasonRef,
+    padding_days: u32,
+) -> Vec<BangumiSubject> {
+    let start = season.broadcast_start(padding_days);
     let end = season.end_exclusive();
     subjects
         .into_iter()
@@ -475,9 +492,86 @@ mod tests {
     #[test]
     fn filters_calendar_to_season() {
         let subjects = parse_calendar_response(&calendar_fixture());
-        let filtered = filter_by_season(subjects, &SeasonRef::new(2026, Season::Fall));
+        let filtered = filter_by_season(subjects, &SeasonRef::new(2026, Season::Fall), 10);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 393010);
+    }
+
+    fn subject(id: u64, year: i32, month: u32, day: u32) -> BangumiSubject {
+        BangumiSubject {
+            id,
+            name: format!("Subject {id}"),
+            name_cn: None,
+            air_date: NaiveDate::from_ymd_opt(year, month, day),
+            platform: Some("TV".to_string()),
+            image: None,
+            official_site: None,
+            weekday_hint: None,
+        }
+    }
+
+    #[test]
+    fn search_window_includes_pre_season_days() {
+        let fall = season_search_body(&SeasonRef::new(2026, Season::Fall), 10);
+        assert_eq!(fall["filter"]["type"][0], 2);
+        assert_eq!(fall["filter"]["air_date"][0], ">=2026-09-21");
+        assert_eq!(fall["filter"]["air_date"][1], "<2027-01-01");
+
+        let cases = [
+            (Season::Winter, ">=2025-12-22", "<2026-04-01"),
+            (Season::Spring, ">=2026-03-22", "<2026-07-01"),
+            (Season::Summer, ">=2026-06-21", "<2026-10-01"),
+        ];
+        for (season, expected_start, expected_end) in cases {
+            let body = season_search_body(&SeasonRef::new(2026, season), 10);
+            assert_eq!(body["filter"]["air_date"][0], expected_start);
+            assert_eq!(body["filter"]["air_date"][1], expected_end);
+        }
+    }
+
+    #[test]
+    fn broadcast_window_boundary_fall() {
+        let season = SeasonRef::new(2026, Season::Fall);
+        let subjects = vec![
+            subject(1, 2026, 9, 20),  // too early, before the padded window
+            subject(2, 2026, 9, 21),  // first broadcast-window day
+            subject(3, 2026, 9, 30),  // late-September premiere
+            subject(4, 2026, 10, 1),  // calendar season start
+            subject(5, 2026, 12, 31), // last day
+            subject(6, 2027, 1, 1),   // next season, excluded
+        ];
+        let ids: Vec<u64> = filter_by_season(subjects, &season, 10)
+            .into_iter()
+            .map(|subject| subject.id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn broadcast_window_is_symmetric_for_winter() {
+        let season = SeasonRef::new(2026, Season::Winter);
+        let subjects = vec![
+            subject(1, 2025, 12, 21), // excluded
+            subject(2, 2025, 12, 22), // included
+            subject(3, 2026, 3, 31),  // included
+            subject(4, 2026, 4, 1),   // excluded (next season)
+        ];
+        let ids: Vec<u64> = filter_by_season(subjects, &season, 10)
+            .into_iter()
+            .map(|subject| subject.id)
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn zero_padding_keeps_calendar_boundary() {
+        let season = SeasonRef::new(2026, Season::Fall);
+        let subjects = vec![subject(1, 2026, 9, 30), subject(2, 2026, 10, 1)];
+        let ids: Vec<u64> = filter_by_season(subjects, &season, 0)
+            .into_iter()
+            .map(|subject| subject.id)
+            .collect();
+        assert_eq!(ids, vec![2]);
     }
 
     #[test]
@@ -523,5 +617,73 @@ mod tests {
         let mut sorted = dates.clone();
         sorted.sort();
         assert_eq!(dates, sorted);
+    }
+
+    #[tokio::test]
+    async fn paginates_until_total_instead_of_stopping_after_four_pages() {
+        use std::io::{Read, Write};
+
+        // The live API returns ~20 subjects per page even with limit=100.
+        // 95 subjects require 5 pages; the old 4-page cap collected only 80.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = 0usize;
+            let pages: [(u64, u64); 5] = [(1, 20), (21, 40), (41, 60), (61, 80), (81, 95)];
+            for (start, end) in pages {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                requests += 1;
+                let data: Vec<_> = (start..=end)
+                    .map(|id| {
+                        serde_json::json!({
+                            "id": id,
+                            "name": format!("Subject {id}"),
+                            "name_cn": "",
+                            "date": "2026-10-05",
+                            "platform": "TV",
+                            "images": {},
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({
+                    "data": data,
+                    "total": 95,
+                    "limit": 100,
+                    "offset": start - 1,
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+            requests
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::for_tests(dir.path().to_path_buf());
+        let client = BangumiClient::with_base(&cfg, &format!("http://{address}")).unwrap();
+        let subjects = client
+            .search_season(&SeasonRef::new(2026, Season::Fall), 120, 10)
+            .await
+            .unwrap();
+        assert_eq!(subjects.len(), 95);
+        assert_eq!(subjects.first().map(|subject| subject.id), Some(1));
+        assert_eq!(subjects.last().map(|subject| subject.id), Some(95));
+        assert_eq!(server.join().unwrap(), 5);
     }
 }

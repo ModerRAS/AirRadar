@@ -22,7 +22,7 @@ use crate::bangumi::BangumiClient;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::extract::{self, RawSlot};
-use crate::fetch::Fetcher;
+use crate::fetch::{FetchStats, Fetcher};
 use crate::llm::{LlmClient, LlmRequest, LlmRunStats, LlmSuggestion};
 use crate::log;
 use crate::model::{
@@ -85,6 +85,39 @@ fn subject_names(subject: &crate::bangumi::BangumiSubject) -> Vec<String> {
     names
 }
 
+/// Least-recently-checked selection window.
+///
+/// With MAX_SUBJECTS_PER_RUN at its 120 default this returns min(season
+/// subjects, 120), so one run covers an entire season.
+fn rotate_selection(
+    subjects: Vec<crate::bangumi::BangumiSubject>,
+    previous: &StateFile,
+    max: usize,
+) -> Vec<crate::bangumi::BangumiSubject> {
+    let mut scored: Vec<(i64, crate::bangumi::BangumiSubject)> = subjects
+        .into_iter()
+        .map(|subject| {
+            let last_checked = previous
+                .subjects
+                .get(&subject.id.to_string())
+                .map(|state| state.last_checked_at.timestamp())
+                .unwrap_or(0);
+            (last_checked, subject)
+        })
+        .collect();
+    scored.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.air_date.cmp(&right.1.air_date))
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(_, subject)| subject)
+        .collect()
+}
+
 fn apply_publish_policy(verification: &mut Verification, publish_medium: bool) {
     if verification.status == ReviewStatus::Published
         && verification.confidence == Confidence::Medium
@@ -137,21 +170,12 @@ impl RunOptions {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct FetchCounters {
-    requested: usize,
-    fetched: usize,
-    cached: usize,
-    failed: usize,
-}
-
 #[derive(Debug)]
 struct SubjectOutcome {
     subject: crate::bangumi::BangumiSubject,
     candidates: Vec<TimeCandidate>,
     verification: Verification,
     search_attempts: Vec<SearchAttempt>,
-    fetch: FetchCounters,
     llm_text: String,
 }
 
@@ -303,21 +327,28 @@ impl Pipeline {
         let previous = self.load_state();
         match self
             .bangumi
-            .fetch_season_list(&season, max_subjects.saturating_mul(3).min(300))
+            .fetch_season_list(
+                &season,
+                max_subjects.saturating_mul(3).min(300),
+                self.cfg.season_padding_days,
+            )
             .await
         {
             Ok((subjects, source)) => {
                 summary.subject_list_source = source.as_str().to_string();
-                summary.subjects_fetched = subjects.len();
-                log::info(format!(
-                    "run {run_id}: {} subjects via {}",
-                    subjects.len(),
-                    source.as_str()
-                ));
+                let raw_count = subjects.len();
                 let filtered: Vec<crate::bangumi::BangumiSubject> = subjects
                     .into_iter()
                     .filter(|subject| self.platform_allowed(subject.platform.as_deref()))
                     .collect();
+                // subjectsFetched is the platform-eligible count (the set the
+                // scheduler can publish); keep the raw Bangumi count in the log.
+                summary.subjects_fetched = filtered.len();
+                log::info(format!(
+                    "run {run_id}: {raw_count} raw subjects via {}, {} platform-allowed",
+                    source.as_str(),
+                    filtered.len()
+                ));
                 let allowed_count = filtered.len();
                 let selected = self.select_subjects(filtered, &previous, max_subjects);
                 log::info(format!(
@@ -325,11 +356,19 @@ impl Pipeline {
                     selected.len(),
                     allowed_count
                 ));
+                let fetch_before = self.fetcher.stats();
                 let (outcomes, summary_updates) = self.process_all(selected, &season).await;
                 summary.subjects_processed = outcomes.len();
                 summary.errors.extend(summary_updates);
-                self.complete_run(summary, previous, outcomes, &season, started_instant)
-                    .await
+                self.complete_run(
+                    summary,
+                    previous,
+                    outcomes,
+                    &season,
+                    started_instant,
+                    fetch_before,
+                )
+                .await
             }
             Err(error) => {
                 summary.errors.push(format!("bangumi: {error}"));
@@ -378,6 +417,7 @@ impl Pipeline {
         mut outcomes: Vec<SubjectOutcome>,
         season: &SeasonRef,
         started_instant: Instant,
+        fetch_before: FetchStats,
     ) -> RunSummary {
         if self.llm.is_some() {
             let stats = self.apply_llm(&mut outcomes).await;
@@ -391,7 +431,7 @@ impl Pipeline {
             };
         }
         summary.search = aggregate_search(&outcomes);
-        summary.fetch = aggregate_fetch(&outcomes);
+        summary.fetch = fetch_stat_from(&self.fetcher.stats().delta_since(&fetch_before));
 
         let mut state = previous;
         let now = Utc::now();
@@ -499,28 +539,7 @@ impl Pipeline {
         previous: &StateFile,
         max: usize,
     ) -> Vec<crate::bangumi::BangumiSubject> {
-        let mut scored: Vec<(i64, crate::bangumi::BangumiSubject)> = subjects
-            .into_iter()
-            .map(|subject| {
-                let last_checked = previous
-                    .subjects
-                    .get(&subject.id.to_string())
-                    .map(|state| state.last_checked_at.timestamp())
-                    .unwrap_or(0);
-                (last_checked, subject)
-            })
-            .collect();
-        scored.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.air_date.cmp(&right.1.air_date))
-                .then_with(|| left.1.id.cmp(&right.1.id))
-        });
-        scored
-            .into_iter()
-            .take(max)
-            .map(|(_, subject)| subject)
-            .collect()
+        rotate_selection(subjects, previous, max)
     }
 
     fn build_queries(&self, subject: &crate::bangumi::BangumiSubject) -> Vec<String> {
@@ -564,7 +583,6 @@ impl Pipeline {
         }
         let mut attempts: Vec<SearchAttempt> = Vec::new();
         let mut llm_parts: Vec<String> = Vec::new();
-        let mut fetch = FetchCounters::default();
         let mut fetched_urls: BTreeSet<String> = BTreeSet::new();
 
         // 1) Web search (snippets).
@@ -582,27 +600,23 @@ impl Pipeline {
         results.retain(|result| is_http_url(&result.url) && seen_urls.insert(result.url.clone()));
         results.truncate(10);
         for result in &results {
-            let domain = domain_of(&result.url);
             if !result.snippet.is_empty() {
                 llm_parts.push(format!("{} {}", result.title, result.snippet));
-                for slot in extract::extract_for_subject(&result.snippet, &names) {
-                    add_candidate(
-                        &mut candidates,
-                        &slot,
-                        &result.url,
-                        &domain,
-                        &result.provider,
-                        "snippet",
-                        &result.snippet,
-                    );
+                // Snippet evidence is extracted from title + snippet so the
+                // title-context filter works even when the snippet omits the
+                // show name. Snippets are independent of page fetches, so a
+                // failed page fetch can still yield a time candidate.
+                for candidate in snippet_candidates(result, &names) {
+                    add_candidate(&mut candidates, candidate);
                 }
             }
         }
 
         // 2) Fetch candidate pages (bounded, domain-deduped).
         let mut used_domains: BTreeSet<String> = BTreeSet::new();
+        let mut pages_loaded = 0usize;
         for result in &results {
-            if fetch.fetched + fetch.cached >= self.cfg.fetch_pages_per_subject {
+            if pages_loaded >= self.cfg.fetch_pages_per_subject {
                 break;
             }
             let domain = domain_of(&result.url);
@@ -612,33 +626,30 @@ impl Pipeline {
             if !fetched_urls.insert(result.url.clone()) {
                 continue;
             }
-            fetch.requested += 1;
             match self.fetcher.get_text(&result.url).await {
                 Ok(page) => {
-                    if page.from_cache {
-                        fetch.cached += 1;
-                    } else {
-                        fetch.fetched += 1;
-                    }
+                    pages_loaded += 1;
                     llm_parts.push(format!(
                         "{} {}",
                         result.title,
                         truncate_chars(&page.text, 1500)
                     ));
+                    let provider = format!("{}:page", result.provider);
                     for slot in extract::extract_for_subject(&page.text, &names) {
                         add_candidate(
                             &mut candidates,
-                            &slot,
-                            &result.url,
-                            &domain,
-                            &result.provider,
-                            "page",
-                            &page.text,
+                            candidate_from_slot(
+                                &slot,
+                                &result.url,
+                                &domain,
+                                &provider,
+                                "page",
+                                &page.text,
+                            ),
                         );
                     }
                 }
                 Err(error) => {
-                    fetch.failed += 1;
                     log::debug(format!("fetch failed for {}: {error}", result.url));
                 }
             }
@@ -652,14 +663,8 @@ impl Pipeline {
                     && !is_blocked_host(&domain)
                     && fetched_urls.insert(site.clone())
                 {
-                    fetch.requested += 1;
                     match self.fetcher.get_text(&site).await {
                         Ok(page) => {
-                            if page.from_cache {
-                                fetch.cached += 1;
-                            } else {
-                                fetch.fetched += 1;
-                            }
                             llm_parts.push(format!(
                                 "{} {}",
                                 subject.name,
@@ -672,17 +677,18 @@ impl Pipeline {
                             for slot in slots {
                                 add_candidate(
                                     &mut candidates,
-                                    &slot,
-                                    &site,
-                                    &domain,
-                                    "official_site",
-                                    "page",
-                                    &page.text,
+                                    candidate_from_slot(
+                                        &slot,
+                                        &site,
+                                        &domain,
+                                        "official_site:page",
+                                        "page",
+                                        &page.text,
+                                    ),
                                 );
                             }
                         }
                         Err(error) => {
-                            fetch.failed += 1;
                             log::debug(format!("official site fetch failed for {site}: {error}"));
                         }
                     }
@@ -699,7 +705,6 @@ impl Pipeline {
             candidates,
             verification,
             search_attempts: attempts,
-            fetch,
             llm_text,
         }
     }
@@ -867,7 +872,7 @@ impl Pipeline {
             schema_version: SCHEMA_VERSION,
             generated_at,
             season: season.label(),
-            season_start: season.start(),
+            season_start: season.broadcast_start(self.cfg.season_padding_days),
             season_end: season.end_inclusive(),
             timezone: SCHEDULE_TIMEZONE.to_string(),
             item_count: items.len(),
@@ -928,21 +933,20 @@ impl Pipeline {
     }
 }
 
-fn add_candidate(
-    candidates: &mut Vec<TimeCandidate>,
+fn candidate_from_slot(
     slot: &RawSlot,
     url: &str,
     domain: &str,
     provider: &str,
     kind: &str,
     source_text: &str,
-) {
+) -> TimeCandidate {
     let evidence = if source_text.is_empty() {
         slot.matched.clone()
     } else {
         format!("{} [{}]", slot.matched, truncate_chars(source_text, 120))
     };
-    let candidate = TimeCandidate {
+    TimeCandidate {
         weekday: Some(slot.weekday),
         time: slot.time.clone(),
         source_url: Some(url.to_string()),
@@ -951,7 +955,27 @@ fn add_candidate(
         method: format!("{}|{}", slot.method, kind),
         evidence,
         observed_at: Utc::now(),
-    };
+    }
+}
+
+/// Extract broadcast slots from one search result title + snippet.
+///
+/// The title is part of the corpus so the title-context filter accepts snippets
+/// that do not repeat the show name. The provider label is suffixed with
+/// :snippet to distinguish snippet evidence from fetched page evidence, while
+/// source_domain stays the result domain (same-domain evidence is not counted
+/// twice by verification).
+fn snippet_candidates(result: &SearchResult, names: &[String]) -> Vec<TimeCandidate> {
+    let corpus = format!("{} {}", result.title, result.snippet);
+    let domain = domain_of(&result.url);
+    let provider = format!("{}:snippet", result.provider);
+    extract::extract_for_subject(&corpus, names)
+        .into_iter()
+        .map(|slot| candidate_from_slot(&slot, &result.url, &domain, &provider, "snippet", &corpus))
+        .collect()
+}
+
+fn add_candidate(candidates: &mut Vec<TimeCandidate>, candidate: TimeCandidate) {
     if candidates.iter().any(|existing| {
         existing.weekday == candidate.weekday
             && existing.time == candidate.time
@@ -1016,15 +1040,17 @@ fn aggregate_search(outcomes: &[SubjectOutcome]) -> Vec<ProviderStat> {
     map.into_values().collect()
 }
 
-fn aggregate_fetch(outcomes: &[SubjectOutcome]) -> FetchStat {
-    let mut stat = FetchStat::default();
-    for outcome in outcomes {
-        stat.requested += outcome.fetch.requested;
-        stat.fetched += outcome.fetch.fetched;
-        stat.from_cache += outcome.fetch.cached;
-        stat.failed += outcome.fetch.failed;
+fn fetch_stat_from(stats: &FetchStats) -> FetchStat {
+    FetchStat {
+        requested: stats.requested,
+        fetched: stats.fetched,
+        from_cache: stats.from_cache,
+        failed: stats.failed,
+        retried: stats.retried,
+        failures_timeout: stats.failures_timeout,
+        failures_http: stats.failures_http,
+        failures_other: stats.failures_other,
     }
-    stat
 }
 
 /// Owns the single-run mutex and the pipeline instance.
@@ -1164,5 +1190,87 @@ mod tests {
         apply_publish_policy(&mut verification, false);
         assert_eq!(verification.status, ReviewStatus::Review);
         assert!(!verification.is_published());
+    }
+
+    fn fake_subject(id: u64) -> crate::bangumi::BangumiSubject {
+        crate::bangumi::BangumiSubject {
+            id,
+            name: format!("Subject {id}"),
+            name_cn: None,
+            air_date: None,
+            platform: Some("TV".to_string()),
+            image: None,
+            official_site: None,
+            weekday_hint: None,
+        }
+    }
+
+    #[test]
+    fn selection_covers_entire_season_up_to_max() {
+        let subjects: Vec<_> = (1..=150).map(fake_subject).collect();
+        let previous = StateFile::empty();
+        // Default MAX_SUBJECTS_PER_RUN (120) covers a full ~100-subject season
+        // in one run and clamps to the season size when smaller.
+        assert_eq!(
+            rotate_selection(subjects.clone(), &previous, 120).len(),
+            120
+        );
+        assert_eq!(
+            rotate_selection(subjects.clone(), &previous, 200).len(),
+            150
+        );
+        assert_eq!(rotate_selection(subjects, &previous, 5).len(), 5);
+    }
+
+    #[test]
+    fn snippet_candidates_use_title_context_and_are_tagged() {
+        let result = SearchResult {
+            title: "作品A".to_string(),
+            url: "https://example.com/schedule".to_string(),
+            snippet: "毎週土曜 23:30 放送".to_string(),
+            provider: "deepseek".to_string(),
+        };
+        let candidates = snippet_candidates(&result, &["作品A".to_string()]);
+        assert_eq!(candidates.len(), 1, "candidates: {candidates:?}");
+        assert_eq!(candidates[0].weekday, Some(6));
+        assert_eq!(candidates[0].time.as_deref(), Some("23:30"));
+        assert_eq!(candidates[0].provider, "deepseek:snippet");
+        assert_eq!(candidates[0].source_domain, "example.com");
+        assert!(candidates[0].method.contains("snippet"));
+        assert!(candidates[0].evidence.contains("作品A"));
+    }
+
+    #[test]
+    fn snippet_candidates_reject_unrelated_show() {
+        let result = SearchResult {
+            title: "番組X".to_string(),
+            url: "https://example.com/x".to_string(),
+            snippet: "毎週土曜 23:30".to_string(),
+            provider: "brave".to_string(),
+        };
+        assert!(snippet_candidates(&result, &["作品A".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn fetch_stats_mapping_keeps_error_categories() {
+        let stats = FetchStats {
+            requested: 10,
+            fetched: 6,
+            from_cache: 2,
+            failed: 2,
+            retried: 2,
+            failures_timeout: 1,
+            failures_http: 1,
+            failures_other: 0,
+        };
+        let mapped = fetch_stat_from(&stats);
+        assert_eq!(mapped.requested, 10);
+        assert_eq!(mapped.fetched, 6);
+        assert_eq!(mapped.from_cache, 2);
+        assert_eq!(mapped.failed, 2);
+        assert_eq!(mapped.retried, 2);
+        assert_eq!(mapped.failures_timeout, 1);
+        assert_eq!(mapped.failures_http, 1);
+        assert_eq!(mapped.failures_other, 0);
     }
 }

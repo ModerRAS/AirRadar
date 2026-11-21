@@ -79,12 +79,13 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `BANGUMI_UA` | `AirRadar/0.1.0 (+repo URL)` | User-Agent for api.bgm.tv (required by Bangumi) |
 | `FETCH_UA` | `BANGUMI_UA` | User-Agent for fetched pages |
 | `SEASON_OVERRIDE` | current JST season | Force a season, e.g. `2026-fall` |
+| `SEASON_PADDING_DAYS` | `10` | Broadcast window starts this many days before the calendar season start (fall starts Sep 21) |
 | `REFRESH_HOURS` | `6` | Collection interval (fractional allowed) |
-| `MAX_SUBJECTS_PER_RUN` | `30` | Processing window per run (rotates by last-checked) |
+| `MAX_SUBJECTS_PER_RUN` | `120` | Processing window per run; a typical season is covered in one run (still rotates by last-checked) |
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platforms to include (`ALL` = no filter) |
 | `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search backends in fallback order; only providers with a key are enabled |
 | `SEARCH_QUERIES_PER_SUBJECT` | `2` | Search queries issued per subject |
-| `MAX_SEARCH_CALLS` | `60` | Search-query budget per run |
+| `MAX_SEARCH_CALLS` | `240` | Search-query budget per run |
 | `SEARCH_FALLBACK_ON_EMPTY` | `false` | Also try the next provider when a provider returns zero results |
 | `SEARCH_TIMEOUT_SECS` | `20` | Per search request timeout |
 | `BRAVE_API_KEY` / `_FILE` | unset | Brave Search API key |
@@ -97,7 +98,7 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `LLM_MODEL` | unset | Extraction fallback model (all three of LLM_BASE_URL/LLM_API_KEY/LLM_MODEL must be set) |
 | `LLM_SESSION_ID` | empty | OpenCode Go session id; when empty a stable id is generated and persisted in `DATA_DIR/llm-session-id` |
 | `LLM_BATCH_SIZE` | `5` | Subjects per LLM request |
-| `MAX_LLM_CALLS` | `10` | LLM request budget per run |
+| `MAX_LLM_CALLS` | `40` | LLM request budget per run |
 | `LLM_MAX_INPUT_CHARS` | `1200` | Text sent per subject to the LLM |
 | `FETCH_TIMEOUT_SECS` | `15` | Page fetch timeout |
 | `FETCH_CONCURRENCY` | `4` | Max concurrent page fetches (clamped 1-8) |
@@ -170,6 +171,14 @@ Seasons follow the Japanese calendar quarters in **JST (UTC+9, no DST)**:
 The current season is derived from the current date in JST, e.g. 2026-11-18 is
 `2026-fall`.
 
+**Broadcast window.** Anime premieres often start a few days before the
+calendar quarter (fall shows start in late September). AirRadar queries
+`[season.start() - SEASON_PADDING_DAYS, season.end_exclusive())`, so with the
+default 10 days the 2026-fall window starts on **2026-09-21** (2026-09-20 is
+excluded). The published `seasonStart` field reports this broadcast-window
+start, not the calendar quarter start. The same padding applies symmetrically
+to winter/spring/summer windows and to the /calendar fallback filter.
+
 
 ## Published data
 
@@ -181,7 +190,7 @@ served verbatim by the API. Field names are camelCase:
   "schemaVersion": 1,
   "generatedAt": "2026-11-18T05:30:00Z",
   "season": "2026-fall",
-  "seasonStart": "2026-10-01",
+  "seasonStart": "2026-09-21",
   "seasonEnd": "2026-12-31",
   "timezone": "Asia/Tokyo",
   "itemCount": 1,
@@ -189,7 +198,7 @@ served verbatim by the API. Field names are camelCase:
     {
       "subjectId": 393010,
       "name": "探偵はもう、死んでいる。 Season 2",
-      "nameCn": "侦探已经死了。 第二季"
+      "nameCn": "侦探已经死了。 第二季",
       "airDate": "2026-10-07",
       "weekday": 3,
       "time": "23:00",
@@ -214,8 +223,11 @@ Clients convert JST to the user's local time zone.
 1. **Discovery**: Bangumi `POST /v0/search/subjects` (empty keyword + `air_date`
    range + `type=2`), falling back to `GET /calendar`. Only
    `id/name/name_cn/air_date/images/platform/infobox` are used.
-2. **Evidence**: search snippets, fetched pages (rules first) and the subject's
-   official website. The optional LLM fallback only runs for subjects that the
+2. **Evidence**: search result titles + snippets (extracted independently of
+   page fetches, so a failed fetch can still yield a time), fetched pages (rules
+   first) and the subject's official website. Transient HTTP failures
+   (timeout/5xx/429) get one retry; failure categories are reported in
+   `/api/status`. The optional LLM fallback only runs for subjects that the
    rules could not resolve.
 3. **Independence = source domain**. A snippet and a page from the same domain
    count once; `llm` counts as one source.
@@ -223,10 +235,14 @@ Clients convert JST to the user's local time zone.
    one -> `medium`; disagreements or missing times -> excluded from the schedule
    and written to `/data/review.json` + `/data/review.md` (human readable).
    Set `PUBLISH_MEDIUM=false` to hold medium-confidence rows for review too.
-5. **No data loss on transient failures**: a subject with no new evidence keeps
-   its previous resolution (`carriedOver` in `state.json`); subjects outside the
-   current `MAX_SUBJECTS_PER_RUN` window are untouched and rotate in on later
-   runs (least-recently-checked first).
+5. **Coverage**: the Bangumi search is paginated until the full broadcast
+   window is collected (the API returns ~20 items per page; earlier versions
+   stopped after 4 pages, capping runs at ~80 subjects). The default
+   `MAX_SUBJECTS_PER_RUN=120` then selects the whole season in one run
+   (min(platform-eligible season size, 120)); if a season is larger, the
+   remaining subjects rotate in on later runs (least-recently-checked first).
+   A subject with no new evidence keeps its previous resolution (`carriedOver`
+   in `state.json`).
 6. **Bounded state**: only the current and previous `STATE_RETENTION_SEASONS`
    seasons are kept in `state.json`; history is pruned to `HISTORY_KEEP`.
 
@@ -237,7 +253,12 @@ Clients convert JST to the user's local time zone.
 | Runtime memory | 128 MiB Swarm limit (`docker-stack.yml`) | small Rust binary, 2 tokio workers, bounded concurrency (4 fetches), streams released after each run |
 | Idle RSS | far below the limit | no browser/database; idle working set was ~10-20 MB in local verification |
 | Disk | < 1 GB | cache 256 MB LRU, history <= 10 versions, state <= 4 seasons, logs on stdout (Docker json-file 10 MB x 3), image ~90 MB |
-| Network | polite | 300 ms minimum interval, 15 s timeout, 200 KB/page, per-domain failure backoff, HTTP 429 pause |
+| Network | polite | 300 ms minimum interval, 15 s timeout, 200 KB/page, per-domain failure backoff, HTTP 429 pause, one retry for transient errors |
+
+The larger default processing window does not raise memory: page fetch
+concurrency stays capped by `FETCH_CONCURRENCY` (4) and the page cache is
+bounded by `CACHE_MAX_BYTES` (256 MB), so a full-season run still fits the
+128 MB Swarm limit.
 
 ## Deployment (Docker Swarm + Traefik + GitHub Actions)
 
@@ -287,8 +308,9 @@ Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 | `TRAEFIK_HOST` / `TRAEFIK_ENTRYPOINTS` / `TRAEFIK_CERTRESOLVER` / `TRAEFIK_NETWORK` | - | May be variables instead of secrets |
 | `BANGUMI_UA` | AirRadar default UA | Bangumi User-Agent |
 | `REFRESH_HOURS` | `6` | Collection interval |
-| `MAX_SUBJECTS_PER_RUN` | `30` | Processing window |
-| `MAX_SEARCH_CALLS` / `MAX_LLM_CALLS` | `60` / `10` | Per-run API budgets |
+| `MAX_SUBJECTS_PER_RUN` | `120` | Processing window (full season in one run) |
+| `MAX_SEARCH_CALLS` / `MAX_LLM_CALLS` | `240` / `40` | Per-run API budgets |
+| `SEASON_PADDING_DAYS` | `10` | Broadcast window padding before the calendar season |
 | `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search fallback order (for DeepSeek-only search use `deepseek`) |
 | `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_MODEL` | DeepSeek defaults | DeepSeek search endpoint/model |
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platform filter |
