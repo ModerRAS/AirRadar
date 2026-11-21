@@ -126,6 +126,16 @@ impl SeasonRef {
             .expect("valid season end date")
     }
 
+    /// Start of the broadcast window for this season.
+    ///
+    /// Japanese anime seasons start airing a little before the calendar
+    /// quarter: late-September premieres belong to the fall season, and the
+    /// same offset applies to the other quarters. padding_days defaults to
+    /// SEASON_PADDING_DAYS (10), which makes fall 2026 start on 2026-09-21.
+    pub fn broadcast_start(&self, padding_days: u32) -> NaiveDate {
+        self.start() - chrono::Duration::days(padding_days as i64)
+    }
+
     pub fn next(&self) -> SeasonRef {
         match self.season {
             Season::Winter => SeasonRef::new(self.year, Season::Spring),
@@ -264,6 +274,36 @@ mod tests {
         assert_eq!(
             SeasonRef::current(ts2),
             SeasonRef::new(2026, Season::Winter)
+        );
+    }
+
+    #[test]
+    fn broadcast_window_padding() {
+        assert_eq!(
+            SeasonRef::new(2026, Season::Fall).broadcast_start(10),
+            date(2026, 9, 21)
+        );
+        assert_eq!(
+            SeasonRef::new(2026, Season::Winter).broadcast_start(10),
+            date(2025, 12, 22)
+        );
+        assert_eq!(
+            SeasonRef::new(2026, Season::Spring).broadcast_start(10),
+            date(2026, 3, 22)
+        );
+        assert_eq!(
+            SeasonRef::new(2026, Season::Summer).broadcast_start(10),
+            date(2026, 6, 21)
+        );
+        // 0 means exactly the calendar season start.
+        assert_eq!(
+            SeasonRef::new(2026, Season::Fall).broadcast_start(0),
+            date(2026, 10, 1)
+        );
+        // 14-day variant used by operators.
+        assert_eq!(
+            SeasonRef::new(2026, Season::Fall).broadcast_start(14),
+            date(2026, 9, 17)
         );
     }
 

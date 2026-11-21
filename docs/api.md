@@ -66,7 +66,7 @@ curl -fsS https://schedule.example.com/api/schedule/latest
   "schemaVersion": 1,
   "generatedAt": "2026-11-18T05:15:00Z",
   "season": "2026-fall",
-  "seasonStart": "2026-10-01",
+  "seasonStart": "2026-09-21",
   "seasonEnd": "2026-12-31",
   "timezone": "Asia/Tokyo",
   "itemCount": 2,
@@ -92,6 +92,10 @@ curl -fsS https://schedule.example.com/api/schedule/latest
 ```
 
 - HTTP 404 `{ "error": "no_schedule_data" }` before the first successful publish.
+- `seasonStart` is the **broadcast window start**: the calendar season start
+  minus `SEASON_PADDING_DAYS` (default 10). For fall 2026 this is
+  **2026-09-21**, so late-September premieres are included; 2026-09-20 is
+  outside the window. `seasonEnd` stays the calendar season end.
 - `items` only contains rows that passed verification; conflicts and missing
   times are in `/data/review.json` / `review.md` on the server.
 - Rows keep their previous resolution when a later collection finds no new
@@ -147,13 +151,13 @@ curl -fsS https://schedule.example.com/api/status
     "durationMs": 5120,
     "ok": true,
     "subjectListSource": "bangumi-search",
-    "subjectsFetched": 168,
-    "subjectsProcessed": 30,
-    "itemsPublished": 12,
-    "highConfidence": 7,
-    "mediumConfidence": 5,
-    "reviewCount": 3,
-    "unknownCount": 15,
+    "subjectsFetched": 172,
+    "subjectsProcessed": 120,
+    "itemsPublished": 48,
+    "highConfidence": 31,
+    "mediumConfidence": 17,
+    "reviewCount": 40,
+    "unknownCount": 72,
     "search": [
       {
         "provider": "brave",
@@ -165,7 +169,16 @@ curl -fsS https://schedule.example.com/api/status
       }
     ],
     "llm": { "configured": false, "calls": 0, "cachedHits": 0, "results": 0, "failures": 0 },
-    "fetch": { "requested": 40, "fetched": 36, "fromCache": 4, "failed": 0 },
+    "fetch": {
+      "requested": 231,
+      "fetched": 104,
+      "fromCache": 5,
+      "failed": 122,
+      "retried": 118,
+      "failuresTimeout": 27,
+      "failuresHttp": 91,
+      "failuresOther": 4
+    },
     "errors": []
   },
   "search": {
@@ -175,8 +188,8 @@ curl -fsS https://schedule.example.com/api/status
   "llm": { "configured": false },
   "cache": { "entries": 118, "bytes": 18342122, "maxBytes": 268435456 },
   "limits": {
-    "maxSubjectsPerRun": 30,
-    "maxLlmCalls": 10,
+    "maxSubjectsPerRun": 120,
+    "maxLlmCalls": 40,
     "fetchConcurrency": 4,
     "historyKeep": 10,
     "cacheMaxBytes": 268435456
@@ -191,6 +204,14 @@ Notes:
   is `null` for a second after a restart until the scheduler loop runs.
 - `search.providers` lists only providers that have a key configured;
   `search.configuredOrder` is the configured fallback order.
+- `lastRun.fetch` counts page fetches: `retried` is the number of extra
+  attempts made by the one-shot transient retry, and
+  `failuresTimeout`/`failuresHttp`/`failuresOther` classify failures.
+- `subjectsFetched` is the number of Bangumi subjects that survived the
+  `INCLUDE_PLATFORMS` filter (the platform-eligible set), and
+  `subjectsProcessed` is the selected window. With the default
+  `MAX_SUBJECTS_PER_RUN=120` and a typical season this is a full-season single
+  run, so `subjectsProcessed` should be close to `subjectsFetched`.
 - `running` is true while a collection is in progress.
 
 ## POST /admin/refresh
