@@ -84,7 +84,7 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `MAX_SUBJECTS_PER_RUN` | `120` | Processing window per run; a typical season is covered in one run (still rotates by last-checked) |
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platforms to include (`ALL` = no filter) |
 | `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search backends in fallback order; only providers with a key are enabled |
-| `SEARCH_QUERIES_PER_SUBJECT` | `2` | Search queries issued per subject |
+| `SEARCH_QUERIES_PER_SUBJECT` | `3` | Search queries issued per subject (third uses `site:` official/Chinese site) |
 | `MAX_SEARCH_CALLS` | `400` | Search-query budget per run |
 | `SEARCH_FALLBACK_ON_EMPTY` | `false` | Also try the next provider when a provider returns zero results |
 | `SEARCH_TIMEOUT_SECS` | `20` | Per search request timeout |
@@ -92,7 +92,7 @@ instead of `NAME` (whitespace-only files are treated as unset).
 | `TAVILY_API_KEY` / `_FILE` | unset | Tavily Search API key |
 | `DEEPSEEK_API_KEY` / `_FILE` | unset | DeepSeek **search** key (independent from the OpenCode Go LLM key) |
 | `DEEPSEEK_SEARCH_URL` | `https://api.deepseek.com/v1/tools/search` | Official DeepSeek server-side Search API (`/chat/completions` keeps the legacy prompt search) |
-| `DEEPSEEK_SEARCH_COUNT` | `10` | Results per DeepSeek search query (1-50) |
+| `DEEPSEEK_SEARCH_COUNT` | `12` | Results per DeepSeek search query (1-50) |
 | `DEEPSEEK_FETCH_URL` | `https://api.deepseek.com/v1/tools/fetch` | Official DeepSeek server-side Fetch API used as a local-fetch fallback |
 | `MAX_DEEPSEEK_FETCH_CALLS` | `150` | Per-run budget for server-side fetch fallback calls |
 | `DEEPSEEK_SEARCH_MODEL` | `deepseek-chat` | Only for legacy `/chat/completions` prompt search |
@@ -133,7 +133,7 @@ Example setup with DeepSeek search + server-side fetch + OpenCode Go LLM:
 SEARCH_PROVIDER_ORDER=deepseek
 DEEPSEEK_API_KEY=<DeepSeek API key>
 DEEPSEEK_SEARCH_URL=https://api.deepseek.com/v1/tools/search
-DEEPSEEK_SEARCH_COUNT=10
+DEEPSEEK_SEARCH_COUNT=12
 DEEPSEEK_FETCH_URL=https://api.deepseek.com/v1/tools/fetch
 MAX_DEEPSEEK_FETCH_CALLS=150
 
@@ -225,6 +225,7 @@ served verbatim by the API. Field names are camelCase:
       "timeKnown": true,
       "timezone": "Asia/Tokyo",
       "confidence": "high",
+      "disputed": false,
       "sources": [
         { "url": "https://example.com/schedule", "domain": "example.com", "provider": "brave" }
       ],
@@ -246,6 +247,11 @@ published with `"time": null`, `"timeKnown": false` and
 compatible; clients should render such rows as "time unknown" under the
 weekday.
 
+Rows published under the disputed policy have `"disputed": true` and
+`"confidence": "low"`: the winning slot is backed by at least two independent
+domains and the dissent is strictly smaller. Ties and single-source conflicts
+stay in the review queue.
+
 ## Data quality & confidence
 
 1. **Discovery**: Bangumi `POST /v0/search/subjects` (empty keyword + `air_date`
@@ -261,12 +267,15 @@ weekday.
 3. **Independence = source domain**. A snippet and a page from the same domain
    count once; `llm` counts as one source.
 4. **Confidence**: two or more independent domains agreeing -> `high`; exactly
-   one -> `medium`; conflicts -> excluded from the schedule and written to
-   `/data/review.json` + `/data/review.md` (human readable). Subjects with no
-   verified time are published as weekday-only rows with confidence `unknown`
-   when `PUBLISH_WEEKDAY_ONLY=true` (default), so the whole season is listed;
-   set it to `false` to keep them in the review queue instead.
-   Set `PUBLISH_MEDIUM=false` to hold medium-confidence rows for review too.
+   one -> `medium`; a winning slot backed by >= 2 independent domains where the
+   dissent is strictly smaller -> published as `low` with `disputed: true`
+   (ties and single-source conflicts stay in review). Subjects with no verified
+   time are published as weekday-only rows with confidence `unknown` when
+   `PUBLISH_WEEKDAY_ONLY=true` (default), so the whole season is listed; set it
+   to `false` to keep them in the review queue instead. Remaining conflicts and
+   unresolved rows are written to `/data/review.json` + `/data/review.md`
+   (human readable). Set `PUBLISH_MEDIUM=false` to hold medium-confidence rows
+   for review too.
 5. **Coverage**: the Bangumi search is paginated until the full broadcast
    window is collected (the API returns ~20 items per page; earlier versions
    stopped after 4 pages, capping runs at ~80 subjects). The default
@@ -348,7 +357,8 @@ Full step-by-step instructions: [docs/deploy.md](docs/deploy.md).
 | `PUBLISH_WEEKDAY_ONLY` | `true` | Publish weekday-only (time unknown) rows |
 | `LLM_BATCH_SIZE` | `8` | Subjects per LLM request |
 | `SEARCH_PROVIDER_ORDER` | `brave,tavily,deepseek` | Search fallback order (for DeepSeek-only search use `deepseek`) |
-| `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_COUNT` | official tools defaults | DeepSeek server-side search endpoint and result count |
+| `SEARCH_QUERIES_PER_SUBJECT` | `3` | Queries per subject; third uses `site:` official/Chinese site |
+| `DEEPSEEK_SEARCH_URL` / `DEEPSEEK_SEARCH_COUNT` | official tools defaults / `12` | DeepSeek server-side search endpoint and result count |
 | `DEEPSEEK_FETCH_URL` / `MAX_DEEPSEEK_FETCH_CALLS` | official tools defaults / `150` | DeepSeek server-side fetch fallback endpoint and per-run budget |
 | `DEEPSEEK_SEARCH_MODEL` | `deepseek-chat` | Only for legacy `/chat/completions` search |
 | `INCLUDE_PLATFORMS` | `TV,WEB` | Bangumi platform filter |

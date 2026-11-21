@@ -82,6 +82,7 @@ curl -fsS https://schedule.example.com/api/schedule/latest
       "timeKnown": true,
       "timezone": "Asia/Tokyo",
       "confidence": "high",
+      "disputed": false,
       "sources": [
         { "url": "https://example.com/schedule", "domain": "example.com", "provider": "brave" },
         { "url": "https://tanmoshi-anime.jp/Season2/", "domain": "tanmoshi-anime.jp", "provider": "official_site" }
@@ -97,8 +98,11 @@ curl -fsS https://schedule.example.com/api/schedule/latest
   minus `SEASON_PADDING_DAYS` (default 10). For fall 2026 this is
   **2026-09-21**, so late-September premieres are included; 2026-09-20 is
   outside the window. `seasonEnd` stays the calendar season end.
-- `items` only contains rows that passed verification; conflicts and missing
-  times are in `/data/review.json` / `review.md` on the server.
+- `items` includes verified rows, weekday-only rows (when
+  `PUBLISH_WEEKDAY_ONLY=true`) and **disputed** rows: a slot backed by >= 2
+  independent domains where the dissent is strictly smaller is published with
+  `"confidence": "low"`, `"disputed": true`. Ties and single-source conflicts
+  stay in `/data/review.json` / `review.md` and are never published.
 - Rows keep their previous resolution when a later collection finds no new
   evidence (transient source failure), so the list does not flap.
 
@@ -156,6 +160,7 @@ curl -fsS https://schedule.example.com/api/status
     "subjectsProcessed": 120,
     "itemsPublished": 96,
     "weekdayOnlyCount": 51,
+    "disputedCount": 15,
     "highConfidence": 28,
     "mediumConfidence": 17,
     "reviewCount": 3,
