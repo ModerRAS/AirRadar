@@ -188,4 +188,24 @@ log "rendered $rule"
 case "$rule" in
   *'Host(`)'*|*'Host(``)'*|*"Host()"*) die "Traefik Host() rule rendered without a domain; check TRAEFIK_HOST on the server" ;;
 esac
+# Wait for the service to converge; if it does not, print task state, service
+# logs and disk usage so a failed rollout is diagnosable from CI output.
+converged=0
+for attempt in $(seq 1 60); do
+  state="$(docker service ps "$(printf '%s_airradar' "$STACK_NAME")" --no-trunc --format '{{.Name}} {{.CurrentState}} {{.Error}}' 2>/dev/null | head -n 1 || true)"
+  if printf '%s' "$state" | grep -q ' Running '; then
+    converged=1
+    break
+  fi
+  sleep 2
+done
+if [ "$converged" != "1" ]; then
+  log "service did not converge; diagnostics follow"
+  docker service ps "$(printf '%s_airradar' "$STACK_NAME")" --no-trunc 2>&1 || true
+  docker service logs --tail 120 "$(printf '%s_airradar' "$STACK_NAME")" 2>&1 || true
+  df -h / /var/lib/docker 2>/dev/null || true
+  docker system df 2>/dev/null || true
+  die "service failed to converge (see task state/logs above)"
+fi
+log "service converged: $state"
 log "deployment finished; check https://$TRAEFIK_HOST/health"
