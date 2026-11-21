@@ -1,0 +1,28 @@
+name: diagnose
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Bash script to run on the Swarm manager (diagnostics only)"
+        required: true
+        default: "docker service ps airradar_airradar --no-trunc; docker service logs --tail 80 airradar_airradar"
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run diagnostic script over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script_stop: true
+          script: |
+            set -x
+            ${{ inputs.script }}
