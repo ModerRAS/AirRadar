@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   diagnose:
+    environment: production
     runs-on: ubuntu-latest
     steps:
       - name: Run diagnostic script over SSH
