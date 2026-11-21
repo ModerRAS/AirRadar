@@ -63,6 +63,9 @@ services:
         max-file: "3"
     deploy:
       replicas: 1
+      placement:
+        constraints:
+          - node.hostname == ${AIRRADAR_NODE:-Ali-HK-2}
       restart_policy:
         condition: any
         delay: 10s
